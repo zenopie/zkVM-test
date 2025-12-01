@@ -187,8 +187,9 @@ fn main() {
     let start_time = Instant::now();
     let prover = default_prover();
 
-    // Use groth16 for smaller proofs (slower but more compact)
-    let opts = ProverOpts::groth16();
+    // Use default STARK proofs (less memory-intensive than Groth16)
+    // Groth16 produces smaller proofs but requires more prover memory
+    let opts = ProverOpts::default();
 
     log("Calling prover.prove_with_ctx()...");
     log("(No further output until proving completes)");
