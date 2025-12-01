@@ -1,0 +1,75 @@
+# Monero RandomX zkVM Verification - GPU Dockerfile
+#
+# Full RandomX with Argon2d (256 MiB cache) - GPU accelerated
+# Runs automatically on container start, outputs to stdout and /app/benchmark.log
+#
+# Build: docker build -f Dockerfile.gpu -t randomx-zkvm-gpu .
+# Run:   docker run --gpus all randomx-zkvm-gpu
+
+# CUDA 12.x base with Ubuntu 22.04
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    gcc \
+    g++ \
+    libssl-dev \
+    pkg-config \
+    curl \
+    git \
+    build-essential \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash zkvm
+USER zkvm
+WORKDIR /home/zkvm
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/zkvm/.cargo/bin:${PATH}"
+
+# Install Risc0 toolchain
+RUN curl -L https://risczero.com/install | bash
+ENV PATH="/home/zkvm/.risc0/bin:${PATH}"
+RUN /home/zkvm/.risc0/bin/rzup install
+
+# Set up environment to use Risc0's Rust toolchain (1.91.1)
+ENV PATH="/home/zkvm/.risc0/toolchains/v1.91.1-rust-x86_64-unknown-linux-gnu/bin:/home/zkvm/.risc0/bin:/home/zkvm/.cargo/bin:${PATH}"
+
+# Copy project files
+COPY --chown=zkvm:zkvm . /home/zkvm/project
+WORKDIR /home/zkvm/project
+
+# Build with release optimizations using Risc0's Rust
+RUN cargo build --release
+
+# Environment for GPU proving
+ENV RISC0_PROVER=cuda
+ENV RUST_LOG=info
+# Unbuffered output for real-time logging
+ENV RUST_BACKTRACE=1
+
+# Create startup script that logs to both stdout and file
+RUN echo '#!/bin/bash\n\
+echo "============================================================"\n\
+echo "  MONERO RANDOMX ZKVM - GPU ACCELERATED"\n\
+echo "  Starting Full RandomX verification with Argon2d..."\n\
+echo "============================================================"\n\
+echo ""\n\
+echo "Prover: $RISC0_PROVER"\n\
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "GPU info unavailable"\n\
+echo ""\n\
+echo "Logs will appear below. This will take 10-60 minutes with GPU."\n\
+echo "============================================================"\n\
+echo ""\n\
+exec cargo run --release 2>&1 | tee /home/zkvm/project/benchmark.log\n\
+' > /home/zkvm/project/start.sh && chmod +x /home/zkvm/project/start.sh
+
+# Run the benchmark automatically
+CMD ["/bin/bash", "/home/zkvm/project/start.sh"]
