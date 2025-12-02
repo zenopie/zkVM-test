@@ -57,7 +57,7 @@ jobs:
           tags: |
             ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:latest
             ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu
-            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-v3
+            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-v4
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
