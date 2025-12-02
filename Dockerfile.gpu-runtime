@@ -1,0 +1,153 @@
+# Monero RandomX zkVM Verification - GPU Runtime Build
+#
+# This image contains all dependencies but builds at RUNTIME on the GPU node.
+# This ensures libcuda.so is available during compilation.
+#
+# Build: docker build -f Dockerfile.gpu-runtime -t randomx-zkvm-gpu-runtime .
+# Run:   docker run --gpus all randomx-zkvm-gpu-runtime
+
+# CUDA 12.x base with Ubuntu 22.04
+FROM nvidia/cuda:12.2.0-devel-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    gcc \
+    g++ \
+    libssl-dev \
+    pkg-config \
+    curl \
+    git \
+    build-essential \
+    ca-certificates \
+    protobuf-compiler \
+    libclang-dev \
+    clang \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash zkvm
+USER zkvm
+WORKDIR /home/zkvm
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/zkvm/.cargo/bin:${PATH}"
+
+# Install Risc0 toolchain
+RUN curl -L https://risczero.com/install | bash
+ENV PATH="/home/zkvm/.risc0/bin:${PATH}"
+RUN /home/zkvm/.risc0/bin/rzup install
+
+# Set up environment to use Risc0's Rust toolchain
+ENV PATH="/home/zkvm/.risc0/toolchains/v1.91.1-rust-x86_64-unknown-linux-gnu/bin:/home/zkvm/.risc0/bin:/home/zkvm/.cargo/bin:${PATH}"
+
+# CUDA environment
+ENV PATH=/usr/local/cuda/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV CUDA_HOME=/usr/local/cuda
+
+# Copy project files (source code only, no pre-built binaries)
+COPY --chown=zkvm:zkvm . /home/zkvm/project
+WORKDIR /home/zkvm/project
+
+# Clean any existing build artifacts
+RUN rm -rf target
+
+# Runtime environment
+ENV RISC0_PROVER=local
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=1
+
+# Create startup script that builds with CUDA then runs
+RUN echo '#!/bin/bash
+set -e
+
+echo "============================================================"
+echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
+echo "  Image Version: gpu-runtime-v1"
+echo "============================================================"
+echo ""
+
+# GPU diagnostics
+echo "=== GPU Detection ==="
+if nvidia-smi > /dev/null 2>&1; then
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+    echo ""
+    nvidia-smi -L
+else
+    echo "ERROR: No NVIDIA GPU detected!"
+    echo "This image requires --gpus all flag"
+    exit 1
+fi
+echo ""
+
+# Check for libcuda.so
+echo "=== CUDA Libraries ==="
+if ldconfig -p | grep -q libcuda; then
+    echo "libcuda.so found:"
+    ldconfig -p | grep libcuda
+else
+    echo "WARNING: libcuda.so not in ldconfig, checking direct..."
+    find /usr -name "libcuda.so*" 2>/dev/null || echo "libcuda.so not found"
+fi
+echo ""
+
+# Build with CUDA
+BINARY="/home/zkvm/project/target/release/host"
+if [ -f "$BINARY" ]; then
+    echo "=== Binary already exists, checking CUDA support ==="
+    if ldd "$BINARY" | grep -q libcuda; then
+        echo "Binary has CUDA support, skipping rebuild"
+    else
+        echo "Binary lacks CUDA, rebuilding..."
+        rm -rf /home/zkvm/project/target
+        NEEDS_BUILD=1
+    fi
+else
+    NEEDS_BUILD=1
+fi
+
+if [ "${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "$BINARY" ]; then
+    echo "=== Building with CUDA support ==="
+    echo "This will take 30-60 minutes for GPU kernel compilation..."
+    echo ""
+
+    cd /home/zkvm/project
+    RUSTFLAGS="-C target-cpu=native" cargo build -F cuda -r -p host 2>&1 | tee /tmp/build.log
+
+    echo ""
+    echo "=== Build complete, verifying CUDA linkage ==="
+
+    if ldd "$BINARY" | grep -q libcuda; then
+        echo "SUCCESS: libcuda.so is linked!"
+        ldd "$BINARY" | grep cuda
+    else
+        echo ""
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "FATAL: libcuda.so NOT linked - CUDA compilation failed"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo ""
+        echo "ldd output:"
+        ldd "$BINARY"
+        echo ""
+        echo "Build log tail:"
+        tail -50 /tmp/build.log
+        exit 1
+    fi
+fi
+
+echo ""
+echo "============================================================"
+echo "  Starting RandomX verification with GPU acceleration..."
+echo "============================================================"
+echo ""
+
+exec "$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
+' > /home/zkvm/project/start.sh && chmod +x /home/zkvm/project/start.sh
+
+# Run the build+benchmark automatically
+CMD ["/bin/bash", "/home/zkvm/project/start.sh"]
