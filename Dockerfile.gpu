@@ -46,6 +46,10 @@ ENV PATH="/home/zkvm/.risc0/toolchains/v1.91.1-rust-x86_64-unknown-linux-gnu/bin
 COPY --chown=zkvm:zkvm . /home/zkvm/project
 WORKDIR /home/zkvm/project
 
+# Set CUDA architecture for cross-compilation (no GPU during build)
+# sm_86 = RTX 3090
+ENV NVCC_APPEND_FLAGS="-arch=sm_86"
+
 # Build with release optimizations using Risc0's Rust
 RUN cargo build --release
 
