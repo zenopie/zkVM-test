@@ -599,7 +599,6 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "blake2",
- "libm",
  "risc0-zkvm",
  "serde",
 ]

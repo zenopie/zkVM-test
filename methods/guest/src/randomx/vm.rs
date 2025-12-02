@@ -7,10 +7,13 @@
 //! - Memory address registers (ma, mx)
 //!
 //! The VM executes randomly generated programs.
+//!
+//! NOTE: All floating point operations use soft-float for deterministic
+//! execution across platforms (required for zkVM).
 
 use crate::randomx::config::*;
 use crate::randomx::program::Program;
-use libm::{fabs, sqrt};
+use crate::randomx::softfloat::{SoftFloat, RoundingMode};
 
 /// Integer register file (8 x 64-bit)
 #[derive(Clone, Debug)]
@@ -52,21 +55,25 @@ impl IntRegisters {
 }
 
 /// Floating point register (128-bit = 2 x 64-bit doubles)
+/// Uses soft-float for deterministic zkVM execution
 #[derive(Clone, Copy, Debug)]
 pub struct FloatRegister {
-    pub lo: f64,
-    pub hi: f64,
+    pub lo: SoftFloat,
+    pub hi: SoftFloat,
 }
 
 impl FloatRegister {
     pub fn new() -> Self {
-        Self { lo: 0.0, hi: 0.0 }
+        Self {
+            lo: SoftFloat::zero(),
+            hi: SoftFloat::zero(),
+        }
     }
 
     pub fn from_u64(lo: u64, hi: u64) -> Self {
         Self {
-            lo: f64::from_bits(lo),
-            hi: f64::from_bits(hi),
+            lo: SoftFloat::from_bits(lo),
+            hi: SoftFloat::from_bits(hi),
         }
     }
 
@@ -75,12 +82,42 @@ impl FloatRegister {
     }
 
     pub fn xor(&mut self, other: &FloatRegister) {
-        self.lo = f64::from_bits(self.lo.to_bits() ^ other.lo.to_bits());
-        self.hi = f64::from_bits(self.hi.to_bits() ^ other.hi.to_bits());
+        self.lo = SoftFloat::from_bits(self.lo.to_bits() ^ other.lo.to_bits());
+        self.hi = SoftFloat::from_bits(self.hi.to_bits() ^ other.hi.to_bits());
     }
 
     pub fn swap(&mut self) {
         core::mem::swap(&mut self.lo, &mut self.hi);
+    }
+
+    /// Add with rounding mode
+    pub fn add(&mut self, other: &FloatRegister, rm: RoundingMode) {
+        self.lo = self.lo.add(other.lo, rm);
+        self.hi = self.hi.add(other.hi, rm);
+    }
+
+    /// Subtract with rounding mode
+    pub fn sub(&mut self, other: &FloatRegister, rm: RoundingMode) {
+        self.lo = self.lo.sub(other.lo, rm);
+        self.hi = self.hi.sub(other.hi, rm);
+    }
+
+    /// Multiply with rounding mode
+    pub fn mul(&mut self, other: &FloatRegister, rm: RoundingMode) {
+        self.lo = self.lo.mul(other.lo, rm);
+        self.hi = self.hi.mul(other.hi, rm);
+    }
+
+    /// Divide with rounding mode
+    pub fn div(&mut self, other: &FloatRegister, rm: RoundingMode) {
+        self.lo = self.lo.div(other.lo, rm);
+        self.hi = self.hi.div(other.hi, rm);
+    }
+
+    /// Square root with rounding mode (takes abs first)
+    pub fn sqrt(&mut self, rm: RoundingMode) {
+        self.lo = self.lo.abs().sqrt(rm);
+        self.hi = self.hi.abs().sqrt(rm);
     }
 }
 
@@ -141,8 +178,8 @@ impl FloatRegisters {
         let exp = STATIC_EXPONENT << MANTISSA_SIZE;
 
         FloatRegister {
-            lo: f64::from_bits((lo & mask) | exp),
-            hi: f64::from_bits((hi & mask) | exp),
+            lo: SoftFloat::from_bits((lo & mask) | exp),
+            hi: SoftFloat::from_bits((hi & mask) | exp),
         }
     }
 }
@@ -488,74 +525,79 @@ impl VmState {
             }
 
             FADD_R => {
-                // F[dst] = F[dst] + A[src]
+                // F[dst] = F[dst] + A[src] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let src_idx = src & 3;
-                self.float_regs.f[dst_idx].lo += self.float_regs.a[src_idx].lo;
-                self.float_regs.f[dst_idx].hi += self.float_regs.a[src_idx].hi;
+                let rm = RoundingMode::from(self.rounding_mode);
+                let src_reg = self.float_regs.a[src_idx];
+                self.float_regs.f[dst_idx].add(&src_reg, rm);
             }
 
             FADD_M => {
-                // F[dst] = F[dst] + [mem]
+                // F[dst] = F[dst] + [mem] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let addr = self.l3_addr(imm as u32, self.int_regs.r[src]);
                 let mem_float = self.read_float(addr);
-                self.float_regs.f[dst_idx].lo += mem_float.lo;
-                self.float_regs.f[dst_idx].hi += mem_float.hi;
+                let rm = RoundingMode::from(self.rounding_mode);
+                self.float_regs.f[dst_idx].add(&mem_float, rm);
             }
 
             FSUB_R => {
-                // F[dst] = F[dst] - A[src]
+                // F[dst] = F[dst] - A[src] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let src_idx = src & 3;
-                self.float_regs.f[dst_idx].lo -= self.float_regs.a[src_idx].lo;
-                self.float_regs.f[dst_idx].hi -= self.float_regs.a[src_idx].hi;
+                let rm = RoundingMode::from(self.rounding_mode);
+                let src_reg = self.float_regs.a[src_idx];
+                self.float_regs.f[dst_idx].sub(&src_reg, rm);
             }
 
             FSUB_M => {
-                // F[dst] = F[dst] - [mem]
+                // F[dst] = F[dst] - [mem] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let addr = self.l3_addr(imm as u32, self.int_regs.r[src]);
                 let mem_float = self.read_float(addr);
-                self.float_regs.f[dst_idx].lo -= mem_float.lo;
-                self.float_regs.f[dst_idx].hi -= mem_float.hi;
+                let rm = RoundingMode::from(self.rounding_mode);
+                self.float_regs.f[dst_idx].sub(&mem_float, rm);
             }
 
             FSCAL_R => {
-                // Scale F register by negating exponent bits
+                // Scale F register by negating exponent bits (bit manipulation, no FPU needed)
                 let dst_idx = dst & 3;
                 self.float_regs.f[dst_idx].lo =
-                    f64::from_bits(self.float_regs.f[dst_idx].lo.to_bits() ^ SCALE_MASK);
+                    SoftFloat::from_bits(self.float_regs.f[dst_idx].lo.to_bits() ^ SCALE_MASK);
                 self.float_regs.f[dst_idx].hi =
-                    f64::from_bits(self.float_regs.f[dst_idx].hi.to_bits() ^ SCALE_MASK);
+                    SoftFloat::from_bits(self.float_regs.f[dst_idx].hi.to_bits() ^ SCALE_MASK);
             }
 
             FMUL_R => {
-                // E[dst] = E[dst] * A[src]
+                // E[dst] = E[dst] * A[src] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let src_idx = src & 3;
-                self.float_regs.e[dst_idx].lo *= self.float_regs.a[src_idx].lo;
-                self.float_regs.e[dst_idx].hi *= self.float_regs.a[src_idx].hi;
+                let rm = RoundingMode::from(self.rounding_mode);
+                let src_reg = self.float_regs.a[src_idx];
+                self.float_regs.e[dst_idx].mul(&src_reg, rm);
             }
 
             FDIV_M => {
-                // E[dst] = E[dst] / [mem]
+                // E[dst] = E[dst] / [mem] (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
                 let addr = self.l3_addr(imm as u32, self.int_regs.r[src]);
                 let mem_float = self.read_float(addr);
                 // Apply E register mask to ensure valid divisor
                 let mask_idx = dst_idx & 1;
-                let divisor_lo = f64::from_bits((mem_float.lo.to_bits() & DYNAMIC_MANTISSA_MASK) | self.e_config.mask[mask_idx]);
-                let divisor_hi = f64::from_bits((mem_float.hi.to_bits() & DYNAMIC_MANTISSA_MASK) | self.e_config.mask[mask_idx]);
-                self.float_regs.e[dst_idx].lo /= divisor_lo;
-                self.float_regs.e[dst_idx].hi /= divisor_hi;
+                let divisor = FloatRegister {
+                    lo: SoftFloat::from_bits((mem_float.lo.to_bits() & DYNAMIC_MANTISSA_MASK) | self.e_config.mask[mask_idx]),
+                    hi: SoftFloat::from_bits((mem_float.hi.to_bits() & DYNAMIC_MANTISSA_MASK) | self.e_config.mask[mask_idx]),
+                };
+                let rm = RoundingMode::from(self.rounding_mode);
+                self.float_regs.e[dst_idx].div(&divisor, rm);
             }
 
             FSQRT_R => {
-                // E[dst] = sqrt(E[dst])
+                // E[dst] = sqrt(abs(E[dst])) (using soft-float with rounding mode)
                 let dst_idx = dst & 3;
-                self.float_regs.e[dst_idx].lo = sqrt(fabs(self.float_regs.e[dst_idx].lo));
-                self.float_regs.e[dst_idx].hi = sqrt(fabs(self.float_regs.e[dst_idx].hi));
+                let rm = RoundingMode::from(self.rounding_mode);
+                self.float_regs.e[dst_idx].sqrt(rm);
             }
 
             CBRANCH => {
