@@ -71,8 +71,8 @@ RUN cargo build --release && \
     rm -rf /home/zkvm/project/target/release/deps && \
     rm -rf /home/zkvm/project/target/release/.fingerprint
 
-# Runtime environment
-ENV RISC0_PROVER=cuda
+# Runtime environment - use "local" prover which auto-uses CUDA if feature is enabled
+ENV RISC0_PROVER=local
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
