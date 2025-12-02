@@ -3,9 +3,13 @@ name = "host"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cuda = ["risc0-zkvm/cuda"]
+
 [dependencies]
 methods = { path = "../methods" }
-risc0-zkvm = { workspace = true, features = ["cuda"] }
+risc0-zkvm = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
 sysinfo = "0.31"

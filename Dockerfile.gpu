@@ -61,32 +61,48 @@ COPY --chown=zkvm:zkvm . /home/zkvm/project
 WORKDIR /home/zkvm/project
 
 # Verify CUDA is accessible during build
-RUN which nvcc && nvcc --version
+RUN which nvcc && nvcc --version && \
+    echo "CUDA_HOME=$CUDA_HOME" && \
+    ls -la /usr/local/cuda/lib64/ | head -5
 
-# Build with release optimizations - CUDA feature enabled in Cargo.toml
-RUN cargo build --release && \
+# Build with CUDA feature - exactly like risc0 official examples
+# RUSTFLAGS="-C target-cpu=native" cargo run -F cuda -r
+# Building GPU kernels takes 30-60 minutes
+RUN echo "Building with CUDA support (GPU kernels take 30-60 min)..." && \
+    RUSTFLAGS="-C target-cpu=native" cargo build -F cuda -r -p host 2>&1 | tee /tmp/build.log && \
+    echo "Build complete. Checking for CUDA symbols..." && \
+    (strings /home/zkvm/project/target/release/host | grep -i cuda | head -10 || echo "No CUDA strings found in binary") && \
     rm -rf /home/zkvm/.cargo/registry && \
-    rm -rf /home/zkvm/.cargo/git && \
-    rm -rf /home/zkvm/project/target/release/build && \
-    rm -rf /home/zkvm/project/target/release/deps && \
-    rm -rf /home/zkvm/project/target/release/.fingerprint
+    rm -rf /home/zkvm/.cargo/git
 
 # Runtime environment - use "local" prover which auto-uses CUDA if feature is enabled
 ENV RISC0_PROVER=local
 ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
-# Create startup script that logs to both stdout and file
+# Create startup script with CUDA diagnostics
 RUN echo '#!/bin/bash\n\
 echo "============================================================"\n\
 echo "  MONERO RANDOMX ZKVM - GPU ACCELERATED"\n\
+echo "  Image Version: gpu-v10"\n\
 echo "  Starting Full RandomX verification with Argon2d..."\n\
 echo "============================================================"\n\
 echo ""\n\
 echo "Prover: $RISC0_PROVER"\n\
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo "GPU info unavailable"\n\
 echo ""\n\
-echo "Logs will appear below. This will take 10-60 minutes with GPU."\n\
+echo "GPU Info:"\n\
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2>/dev/null || echo "GPU info unavailable"\n\
+echo ""\n\
+echo "CUDA Check:"\n\
+nvidia-smi -L 2>/dev/null || echo "No NVIDIA GPUs detected"\n\
+echo ""\n\
+echo "Binary CUDA support check:"\n\
+strings /home/zkvm/project/target/release/host 2>/dev/null | grep -i "cuda\\|gpu\\|nvidia" | head -5 || echo "No CUDA strings in binary"\n\
+echo ""\n\
+echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"\n\
+echo "CUDA_HOME: $CUDA_HOME"\n\
+echo ""\n\
+echo "Logs will appear below. With GPU: 5-15 min. Without GPU: hours."\n\
 echo "============================================================"\n\
 echo ""\n\
 exec /home/zkvm/project/target/release/host 2>&1 | tee /home/zkvm/project/benchmark.log\n\
