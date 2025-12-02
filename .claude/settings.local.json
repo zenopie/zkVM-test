@@ -11,7 +11,10 @@
       "Bash(cargo update:*)",
       "Bash(cargo run:*)",
       "Bash(docker build:*)",
-      "Bash(docker run:*)"
+      "Bash(docker run:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker system prune:*)",
+      "Bash(docker volume prune:*)"
     ],
     "deny": [],
     "ask": []
