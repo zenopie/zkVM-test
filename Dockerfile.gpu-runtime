@@ -70,8 +70,15 @@ set -e
 
 echo "============================================================"
 echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v2"
+echo "  Image Version: gpu-runtime-v4"
 echo "============================================================"
+echo ""
+
+# Environment check
+echo "=== Environment Variables ==="
+echo "RUST_LOG: \$RUST_LOG"
+echo "RISC0_PROVER: \$RISC0_PROVER"
+echo "RUST_BACKTRACE: \$RUST_BACKTRACE"
 echo ""
 
 # GPU diagnostics
@@ -148,7 +155,19 @@ echo "  Starting RandomX verification with GPU acceleration..."
 echo "============================================================"
 echo ""
 
-exec "\$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
+"\$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
+EXIT_CODE=\$?
+
+echo ""
+echo "============================================================"
+echo "  PROCESS COMPLETE - Exit code: \$EXIT_CODE"
+echo "  Results saved to /home/zkvm/project/benchmark.log"
+echo "  Container will stay alive until manually closed"
+echo "============================================================"
+echo ""
+
+# Keep container alive so logs can be retrieved
+sleep infinity
 EOF
 RUN chmod +x /home/zkvm/project/start.sh
 
