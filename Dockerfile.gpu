@@ -40,12 +40,14 @@ ENV PATH="/home/zkvm/.cargo/bin:${PATH}"
 # Install Risc0 toolchain with CUDA support
 RUN curl -L https://risczero.com/install | bash
 ENV PATH="/home/zkvm/.risc0/bin:${PATH}"
-# Install base toolchain, then CUDA prover component
-RUN /home/zkvm/.risc0/bin/rzup install && \
-    /home/zkvm/.risc0/bin/rzup install cuda || true
-# List what was installed for debugging
-RUN ls -la /home/zkvm/.risc0/ && \
-    /home/zkvm/.risc0/bin/rzup --help 2>&1 | head -50 || true
+# Install base toolchain
+RUN /home/zkvm/.risc0/bin/rzup install
+
+# List available rzup components and try installing cuda
+RUN echo "=== Available rzup commands ===" && \
+    /home/zkvm/.risc0/bin/rzup --help && \
+    echo "=== Installed components ===" && \
+    ls -la /home/zkvm/.risc0/
 
 # Set up environment to use Risc0's Rust toolchain (1.91.1)
 ENV PATH="/home/zkvm/.risc0/toolchains/v1.91.1-rust-x86_64-unknown-linux-gnu/bin:/home/zkvm/.risc0/bin:/home/zkvm/.cargo/bin:${PATH}"
@@ -66,12 +68,31 @@ RUN which nvcc && nvcc --version && \
     ls -la /usr/local/cuda/lib64/ | head -5
 
 # Build with CUDA feature - exactly like risc0 official examples
-# RUSTFLAGS="-C target-cpu=native" cargo run -F cuda -r
 # Building GPU kernels takes 30-60 minutes
-RUN echo "Building with CUDA support (GPU kernels take 30-60 min)..." && \
+RUN echo "=== Building with CUDA support ===" && \
+    echo "This will take 30-60 minutes for GPU kernel compilation..." && \
     RUSTFLAGS="-C target-cpu=native" cargo build -F cuda -r -p host 2>&1 | tee /tmp/build.log && \
-    echo "Build complete. Checking for CUDA symbols..." && \
-    (strings /home/zkvm/project/target/release/host | grep -i cuda | head -10 || echo "No CUDA strings found in binary") && \
+    echo "=== Build complete ===" && \
+    echo "Checking for CUDA/libcuda in binary..." && \
+    if ldd /home/zkvm/project/target/release/host | grep -q libcuda; then \
+        echo "SUCCESS: libcuda.so is linked!"; \
+        ldd /home/zkvm/project/target/release/host | grep cuda; \
+    else \
+        echo ""; \
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; \
+        echo "FATAL ERROR: libcuda.so NOT linked - CUDA was NOT compiled in"; \
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; \
+        echo ""; \
+        echo "ldd output:"; \
+        ldd /home/zkvm/project/target/release/host; \
+        echo ""; \
+        echo "Checking for any cuda strings:"; \
+        strings /home/zkvm/project/target/release/host | grep -i cuda | head -20 || echo "No CUDA strings found"; \
+        echo ""; \
+        echo "Build log tail:"; \
+        tail -100 /tmp/build.log; \
+        exit 1; \
+    fi && \
     rm -rf /home/zkvm/.cargo/registry && \
     rm -rf /home/zkvm/.cargo/git
 
@@ -84,7 +105,7 @@ ENV RUST_BACKTRACE=1
 RUN echo '#!/bin/bash\n\
 echo "============================================================"\n\
 echo "  MONERO RANDOMX ZKVM - GPU ACCELERATED"\n\
-echo "  Image Version: gpu-v10"\n\
+echo "  Image Version: gpu-v11"\n\
 echo "  Starting Full RandomX verification with Argon2d..."\n\
 echo "============================================================"\n\
 echo ""\n\
