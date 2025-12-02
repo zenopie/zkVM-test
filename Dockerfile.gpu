@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     ca-certificates \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
