@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   randomx-zkvm:
-    image: ghcr.io/zenopie/zkvm-test:gpu-v4
+    image: ghcr.io/zenopie/zkvm-test:gpu-v5
     env:
       - RISC0_PROVER=cuda
       - RUST_LOG=info

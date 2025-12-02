@@ -63,8 +63,8 @@ WORKDIR /home/zkvm/project
 # Verify CUDA is accessible during build
 RUN which nvcc && nvcc --version
 
-# Build with release optimizations - CUDA must be detectable here
-RUN cargo build --release --features cuda && \
+# Build with release optimizations - CUDA feature enabled in Cargo.toml
+RUN cargo build --release && \
     rm -rf /home/zkvm/.cargo/registry && \
     rm -rf /home/zkvm/.cargo/git && \
     rm -rf /home/zkvm/project/target/release/build && \
