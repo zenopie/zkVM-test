@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Monero RandomX zkVM Verification - GPU Runtime Build
 #
 # This image contains all dependencies but builds at RUNTIME on the GPU node.
@@ -63,7 +64,8 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 # Create startup script that builds with CUDA then runs
-RUN echo '#!/bin/bash
+COPY --chown=zkvm:zkvm <<EOF /home/zkvm/project/start.sh
+#!/bin/bash
 set -e
 
 echo "============================================================"
@@ -98,9 +100,9 @@ echo ""
 
 # Build with CUDA
 BINARY="/home/zkvm/project/target/release/host"
-if [ -f "$BINARY" ]; then
+if [ -f "\$BINARY" ]; then
     echo "=== Binary already exists, checking CUDA support ==="
-    if ldd "$BINARY" | grep -q libcuda; then
+    if ldd "\$BINARY" | grep -q libcuda; then
         echo "Binary has CUDA support, skipping rebuild"
     else
         echo "Binary lacks CUDA, rebuilding..."
@@ -111,7 +113,7 @@ else
     NEEDS_BUILD=1
 fi
 
-if [ "${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "$BINARY" ]; then
+if [ "\${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "\$BINARY" ]; then
     echo "=== Building with CUDA support ==="
     echo "This will take 30-60 minutes for GPU kernel compilation..."
     echo ""
@@ -122,9 +124,9 @@ if [ "${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "$BINARY" ]; then
     echo ""
     echo "=== Build complete, verifying CUDA linkage ==="
 
-    if ldd "$BINARY" | grep -q libcuda; then
+    if ldd "\$BINARY" | grep -q libcuda; then
         echo "SUCCESS: libcuda.so is linked!"
-        ldd "$BINARY" | grep cuda
+        ldd "\$BINARY" | grep cuda
     else
         echo ""
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
@@ -132,7 +134,7 @@ if [ "${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "$BINARY" ]; then
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         echo ""
         echo "ldd output:"
-        ldd "$BINARY"
+        ldd "\$BINARY"
         echo ""
         echo "Build log tail:"
         tail -50 /tmp/build.log
@@ -146,8 +148,9 @@ echo "  Starting RandomX verification with GPU acceleration..."
 echo "============================================================"
 echo ""
 
-exec "$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
-' > /home/zkvm/project/start.sh && chmod +x /home/zkvm/project/start.sh
+exec "\$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
+EOF
+RUN chmod +x /home/zkvm/project/start.sh
 
 # Run the build+benchmark automatically
 CMD ["/bin/bash", "/home/zkvm/project/start.sh"]
