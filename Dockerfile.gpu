@@ -54,7 +54,13 @@ WORKDIR /home/zkvm/project
 ENV NVCC_APPEND_FLAGS="-arch=sm_86"
 
 # Build with release optimizations using Risc0's Rust
-RUN cargo build --release
+RUN cargo build --release && \
+    rm -rf /home/zkvm/.risc0/toolchains && \
+    rm -rf /home/zkvm/.cargo/registry && \
+    rm -rf /home/zkvm/.cargo/git && \
+    rm -rf /home/zkvm/project/target/release/build && \
+    rm -rf /home/zkvm/project/target/release/deps && \
+    rm -rf /home/zkvm/project/target/release/.fingerprint
 
 # Environment for GPU proving
 ENV RISC0_PROVER=cuda
@@ -75,7 +81,7 @@ echo ""\n\
 echo "Logs will appear below. This will take 10-60 minutes with GPU."\n\
 echo "============================================================"\n\
 echo ""\n\
-exec cargo run --release 2>&1 | tee /home/zkvm/project/benchmark.log\n\
+exec /home/zkvm/project/target/release/host 2>&1 | tee /home/zkvm/project/benchmark.log\n\
 ' > /home/zkvm/project/start.sh && chmod +x /home/zkvm/project/start.sh
 
 # Run the benchmark automatically
