@@ -37,10 +37,15 @@ WORKDIR /home/zkvm
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/home/zkvm/.cargo/bin:${PATH}"
 
-# Install Risc0 toolchain
+# Install Risc0 toolchain with CUDA support
 RUN curl -L https://risczero.com/install | bash
 ENV PATH="/home/zkvm/.risc0/bin:${PATH}"
-RUN /home/zkvm/.risc0/bin/rzup install
+# Install base toolchain, then CUDA prover component
+RUN /home/zkvm/.risc0/bin/rzup install && \
+    /home/zkvm/.risc0/bin/rzup install cuda || true
+# List what was installed for debugging
+RUN ls -la /home/zkvm/.risc0/ && \
+    /home/zkvm/.risc0/bin/rzup --help 2>&1 | head -50 || true
 
 # Set up environment to use Risc0's Rust toolchain (1.91.1)
 ENV PATH="/home/zkvm/.risc0/toolchains/v1.91.1-rust-x86_64-unknown-linux-gnu/bin:/home/zkvm/.risc0/bin:/home/zkvm/.cargo/bin:${PATH}"
@@ -54,8 +59,8 @@ WORKDIR /home/zkvm/project
 ENV NVCC_APPEND_FLAGS="-arch=sm_86"
 
 # Build with release optimizations using Risc0's Rust
+# Note: Keep .risc0 directory intact - CUDA prover needs runtime files
 RUN cargo build --release && \
-    rm -rf /home/zkvm/.risc0/toolchains && \
     rm -rf /home/zkvm/.cargo/registry && \
     rm -rf /home/zkvm/.cargo/git && \
     rm -rf /home/zkvm/project/target/release/build && \
@@ -67,6 +72,9 @@ ENV RISC0_PROVER=cuda
 ENV RUST_LOG=info
 # Unbuffered output for real-time logging
 ENV RUST_BACKTRACE=1
+# CUDA library paths (required for runtime)
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+ENV PATH=/usr/local/cuda/bin:${PATH}
 
 # Create startup script that logs to both stdout and file
 RUN echo '#!/bin/bash\n\
