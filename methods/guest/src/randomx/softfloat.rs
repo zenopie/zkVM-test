@@ -1,13 +1,13 @@
-//! Soft-float wrapper using the `softfloat` crate
+//! Soft-float wrapper using the `softfloat` crate (koute)
 //!
-//! Uses the battle-tested softfloat crate for IEEE 754 compliance
-//! to ensure deterministic floating point operations in zkVM.
+//! Uses the battle-tested softfloat crate for deterministic IEEE 754 operations.
+//! Currently uses round-to-nearest-even for all operations (rounding modes ignored).
+//! This ensures deterministic execution in zkVM while we verify the approach works.
 
 use softfloat::F64;
 
-/// Rounding modes (IEEE 754)
-/// Note: The softfloat crate uses round-to-nearest-even by default
-/// We map RandomX rounding modes but the crate may not support all modes
+/// Rounding modes (IEEE 754) - matches RandomX CFROUND instruction
+/// NOTE: Currently ignored - all ops use round-to-nearest-even
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(u8)]
 pub enum RoundingMode {
@@ -71,8 +71,7 @@ impl SoftFloat {
         }
     }
 
-    /// Addition with rounding mode
-    /// Note: softfloat crate uses default rounding, we accept rm for API compatibility
+    /// Addition (rounding mode ignored - uses round-to-nearest-even)
     #[inline]
     pub fn add(self, other: Self, _rm: RoundingMode) -> Self {
         Self {
@@ -80,7 +79,7 @@ impl SoftFloat {
         }
     }
 
-    /// Subtraction with rounding mode
+    /// Subtraction (rounding mode ignored - uses round-to-nearest-even)
     #[inline]
     pub fn sub(self, other: Self, _rm: RoundingMode) -> Self {
         Self {
@@ -88,7 +87,7 @@ impl SoftFloat {
         }
     }
 
-    /// Multiplication with rounding mode
+    /// Multiplication (rounding mode ignored - uses round-to-nearest-even)
     #[inline]
     pub fn mul(self, other: Self, _rm: RoundingMode) -> Self {
         Self {
@@ -96,7 +95,7 @@ impl SoftFloat {
         }
     }
 
-    /// Division with rounding mode
+    /// Division (rounding mode ignored - uses round-to-nearest-even)
     #[inline]
     pub fn div(self, other: Self, _rm: RoundingMode) -> Self {
         Self {
@@ -104,7 +103,7 @@ impl SoftFloat {
         }
     }
 
-    /// Square root with rounding mode
+    /// Square root (rounding mode ignored - uses round-to-nearest-even)
     #[inline]
     pub fn sqrt(self, _rm: RoundingMode) -> Self {
         Self {

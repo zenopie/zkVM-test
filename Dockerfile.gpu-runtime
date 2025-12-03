@@ -70,7 +70,7 @@ set -e
 
 echo "============================================================"
 echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v6 (softfloat crate for IEEE 754)"
+echo "  Image Version: gpu-runtime-v7 (manual IEEE 754 with rounding modes)"
 echo "============================================================"
 echo ""
 
