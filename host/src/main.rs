@@ -16,6 +16,9 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
 
+/// Version - keep in sync with methods/guest/src/lib.rs
+const VERSION: &str = "v13";
+
 /// Phase 1 Input
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Phase1Input {
@@ -207,7 +210,7 @@ fn expand_cache_from_seed(seed: &[u8; 64], size: usize) -> Vec<u8> {
 fn main() {
     log_separator();
     println!("  MONERO RANDOMX ZKVM - TWO PHASE VERIFICATION");
-    println!("  Version: v12 (Split Proofs)");
+    println!("  Version: {} (Split Proofs)", VERSION);
     log_separator();
 
     println!();
@@ -399,7 +402,8 @@ fn main() {
     log_separator();
 
     log("Preparing Phase 2 input...");
-    log(&format!("    Cache size: {} MiB", cache.len() / 1_048_576));
+    let cache_size_mib = cache.len() / 1_048_576;
+    log(&format!("    Cache size: {} MiB", cache_size_mib));
     log(&format!("    Input data: {} bytes", header.hashing_blob.len()));
     log(&format!("    Expected cache hash: 0x{}...", hex::encode(&phase1_output.cache_hash[..8])));
 
@@ -412,7 +416,7 @@ fn main() {
     };
 
     log("Building Phase 2 executor environment...");
-    log(&format!("(This includes serializing {} MiB cache as input)", cache.len() / 1_048_576));
+    log(&format!("(This includes serializing {} MiB cache as input)", cache_size_mib));
     let env_start = Instant::now();
     let phase2_env = ExecutorEnv::builder()
         .write(&phase2_input)

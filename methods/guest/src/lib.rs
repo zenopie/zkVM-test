@@ -12,6 +12,12 @@ pub mod randomx;
 // TEST CONFIGURATION - Adjust these values as needed
 // ============================================================
 
+/// Version string - UPDATE ALSO IN:
+///   - Dockerfile.gpu-runtime (line ~74 and tag)
+///   - deploy-akash-runtime.yaml (image tag)
+///   - .github/workflows/docker-build-gpu-runtime.yml (tags)
+pub const VERSION: &str = "v13";
+
 /// Cache size for Phase 1 (Argon2d initialization)
 /// Full Monero: 268435456 (256 MiB)
 /// Current test: 134217728 (128 MiB)
