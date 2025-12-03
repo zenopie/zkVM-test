@@ -13,3 +13,6 @@ risc0-zkvm = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
 sysinfo = "0.31"
+# For host-side cache computation (must match guest implementation)
+argon2 = "0.5"
+blake2 = "0.10"

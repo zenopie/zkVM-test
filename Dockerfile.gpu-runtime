@@ -70,8 +70,13 @@ set -e
 
 echo "============================================================"
 echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v11 (1 prog, full iters, full cache)"
+echo "  Image Version: gpu-runtime-v12 (SPLIT PROOFS)"
 echo "============================================================"
+echo ""
+echo "Architecture: Two-Phase Split Proofs"
+echo "  Phase 1: Argon2d cache init - REUSABLE for ~2048 blocks"
+echo "  Phase 2: VM execution (scratchpad fill + programs)"
+echo "  Configuration: See methods/guest/src/lib.rs for current values"
 echo ""
 
 # Environment check

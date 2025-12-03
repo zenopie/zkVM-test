@@ -3,6 +3,22 @@ name = "guest"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "phase1_cache"
+path = "src/bin/phase1_cache.rs"
+
+[[bin]]
+name = "phase2_vm"
+path = "src/bin/phase2_vm.rs"
+
+# Keep original combined guest for reference/testing
+[[bin]]
+name = "guest"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
