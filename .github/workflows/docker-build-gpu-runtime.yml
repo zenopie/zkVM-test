@@ -41,7 +41,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime
-            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime-v7
+            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime-v8
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

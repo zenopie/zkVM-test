@@ -14,7 +14,13 @@ use alloc::vec::Vec;
 use risc0_zkvm::guest::env;
 use serde::{Deserialize, Serialize};
 
-use randomx::{randomx_hash, verify_difficulty, RANDOMX_SCRATCHPAD_L3, RANDOMX_CACHE_SIZE};
+use randomx::{randomx_hash_with_cache_size, verify_difficulty};
+
+// TESTING: Use tiny cache to verify proving works at all
+// Real Monero uses 256 MiB cache and 2 MiB scratchpad
+// We use much smaller sizes for faster proving during debugging
+const TEST_CACHE_SIZE: usize = 1048576; // 1 MiB (vs 256 MiB)
+const TEST_SCRATCHPAD_SIZE: usize = 65536; // 64 KiB (vs 2 MiB)
 
 risc0_zkvm::guest::entry!(main);
 
@@ -71,9 +77,14 @@ fn main() {
     assert!(input.header.major_version >= 1, "Invalid major version");
     assert!(!input.header.hashing_blob.is_empty(), "Empty hashing blob");
 
-    // Compute the full RandomX hash with Argon2d cache
-    // This is the real Monero verification!
-    let pow_hash = randomx_hash(&input.randomx_key, &input.header.hashing_blob);
+    // Compute RandomX hash with TINY cache for testing
+    // This won't match real Monero hashes but lets us verify proving works
+    let pow_hash = randomx_hash_with_cache_size(
+        &input.randomx_key,
+        &input.header.hashing_blob,
+        TEST_CACHE_SIZE,
+        TEST_SCRATCHPAD_SIZE,
+    );
 
     // Verify difficulty
     let difficulty_valid = verify_difficulty(&pow_hash, input.difficulty);
@@ -83,8 +94,8 @@ fn main() {
         height: input.header.height,
         pow_hash,
         difficulty_valid,
-        cache_size: RANDOMX_CACHE_SIZE,
-        scratchpad_size: RANDOMX_SCRATCHPAD_L3,
+        cache_size: TEST_CACHE_SIZE,
+        scratchpad_size: TEST_SCRATCHPAD_SIZE,
     };
 
     env::commit(&output);
