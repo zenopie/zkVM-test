@@ -169,14 +169,10 @@ fn main() {
     let mem_before = sys.used_memory();
 
     // Build executor environment
-    // Use smaller segments to reduce memory pressure during proving
-    // Default is ~20-21, lowering to 18 halves memory per segment 4x
     log("Building executor environment...");
-    log("Using segment_limit_po2=18 for reduced memory per segment");
     let env = ExecutorEnv::builder()
         .write(&input)
         .expect("Failed to write input")
-        .segment_limit_po2(18) // 2^18 = 262k cycles per segment (vs ~1-2M default)
         .build()
         .expect("Failed to build executor env");
 

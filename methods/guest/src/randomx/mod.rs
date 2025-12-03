@@ -16,4 +16,4 @@ pub mod hash;
 pub mod softfloat;
 
 pub use config::*;
-pub use hash::{randomx_hash, randomx_hash_with_size, randomx_hash_with_cache_size, verify_difficulty};
+pub use hash::{randomx_hash, randomx_hash_with_size, randomx_hash_with_cache_size, randomx_hash_minimal, verify_difficulty};

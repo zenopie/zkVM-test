@@ -14,13 +14,16 @@ use alloc::vec::Vec;
 use risc0_zkvm::guest::env;
 use serde::{Deserialize, Serialize};
 
-use randomx::{randomx_hash_with_cache_size, verify_difficulty};
+use randomx::{randomx_hash_minimal, verify_difficulty};
 
-// TESTING: Use tiny cache to verify proving works at all
-// Real Monero uses 256 MiB cache and 2 MiB scratchpad
-// We use much smaller sizes for faster proving during debugging
+// TESTING: Use minimal parameters to verify proving works at all
+// Real Monero uses 256 MiB cache, 2 MiB scratchpad, 8 programs, 2048 iterations
+// We use much smaller values for faster proving during debugging
 const TEST_CACHE_SIZE: usize = 1048576; // 1 MiB (vs 256 MiB)
 const TEST_SCRATCHPAD_SIZE: usize = 65536; // 64 KiB (vs 2 MiB)
+const TEST_PROGRAM_COUNT: usize = 1; // 1 (vs 8) = 8x faster
+const TEST_ITERATIONS: usize = 128; // 128 (vs 2048) = 16x faster
+// Combined: 128x fewer VM operations!
 
 risc0_zkvm::guest::entry!(main);
 
@@ -77,13 +80,15 @@ fn main() {
     assert!(input.header.major_version >= 1, "Invalid major version");
     assert!(!input.header.hashing_blob.is_empty(), "Empty hashing blob");
 
-    // Compute RandomX hash with TINY cache for testing
+    // Compute RandomX hash with MINIMAL settings for testing
     // This won't match real Monero hashes but lets us verify proving works
-    let pow_hash = randomx_hash_with_cache_size(
+    let pow_hash = randomx_hash_minimal(
         &input.randomx_key,
         &input.header.hashing_blob,
         TEST_CACHE_SIZE,
         TEST_SCRATCHPAD_SIZE,
+        TEST_PROGRAM_COUNT,
+        TEST_ITERATIONS,
     );
 
     // Verify difficulty

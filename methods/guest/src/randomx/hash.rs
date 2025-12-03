@@ -78,6 +78,12 @@ impl RandomXVm {
 
     /// Compute RandomX hash
     pub fn hash(&mut self, input: &[u8]) -> [u8; 32] {
+        self.hash_minimal(input, RANDOMX_PROGRAM_COUNT, RANDOMX_PROGRAM_ITERATIONS)
+    }
+
+    /// Compute RandomX hash with configurable program count and iterations
+    /// For testing: use small values like (1, 128) for 128x faster proving
+    pub fn hash_minimal(&mut self, input: &[u8], program_count: usize, iterations: usize) -> [u8; 32] {
         // Step 1: Hash input to get 64-byte seed
         let seed_hash = blake2b_hash(input);
 
@@ -91,7 +97,7 @@ impl RandomXVm {
         let mut reg_seed = seed_hash;
 
         // Execute multiple programs
-        for program_idx in 0..RANDOMX_PROGRAM_COUNT {
+        for program_idx in 0..program_count {
             // Generate program from current seed
             let program = Program::generate(&reg_seed);
 
@@ -99,7 +105,7 @@ impl RandomXVm {
             self.vm.init(&reg_seed, &program.entropy);
 
             // Execute program iterations
-            for _iter in 0..RANDOMX_PROGRAM_ITERATIONS {
+            for _iter in 0..iterations {
                 // Execute the program
                 self.vm.execute_program(&program);
 
@@ -139,7 +145,7 @@ impl RandomXVm {
             let reg_file = self.vm.get_register_file();
 
             // Hash register file for next program
-            if program_idx < RANDOMX_PROGRAM_COUNT - 1 {
+            if program_idx < program_count - 1 {
                 reg_seed = aes_hash_register_file(&reg_file);
             }
         }
@@ -200,6 +206,20 @@ pub fn randomx_hash_with_cache_size(
 ) -> [u8; 32] {
     let mut vm = RandomXVm::new_with_cache_size(key, cache_size, scratchpad_size);
     vm.hash(input)
+}
+
+/// Compute RandomX hash with ALL parameters configurable (for minimal testing)
+/// This allows reducing program_count and iterations for fast prover testing
+pub fn randomx_hash_minimal(
+    key: &[u8],
+    input: &[u8],
+    cache_size: usize,
+    scratchpad_size: usize,
+    program_count: usize,
+    iterations: usize,
+) -> [u8; 32] {
+    let mut vm = RandomXVm::new_with_cache_size(key, cache_size, scratchpad_size);
+    vm.hash_minimal(input, program_count, iterations)
 }
 
 /// Verify that a hash meets difficulty target
