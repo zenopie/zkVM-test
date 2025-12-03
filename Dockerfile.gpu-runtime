@@ -70,7 +70,7 @@ set -e
 
 echo "============================================================"
 echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v13 (see methods/guest/src/lib.rs VERSION)"
+echo "  Image Version: gpu-runtime-v14 (see methods/guest/src/lib.rs VERSION)"
 echo "============================================================"
 echo ""
 echo "Architecture: Two-Phase Split Proofs"

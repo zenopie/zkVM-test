@@ -81,6 +81,8 @@ pub fn init_cache_with_size(key: &[u8], size: usize) -> Vec<u8> {
 ///
 /// RandomX expands the Argon2d memory state using AES in a specific pattern.
 /// This fills the cache with pseudo-random data derived from the seed.
+///
+/// This version works in-place to avoid cloning the entire cache (saves ~256 MiB).
 fn expand_cache_from_seed(seed: &[u8; 64], size: usize) -> Vec<u8> {
     use crate::randomx::aes::{AesState, aes_round, SoftAes};
 
@@ -94,25 +96,38 @@ fn expand_cache_from_seed(seed: &[u8; 64], size: usize) -> Vec<u8> {
     let mut key = [0u8; 16];
     key.copy_from_slice(&seed[0..16]);
 
+    // In-place mixing - use small buffers to avoid cloning entire cache
+    // We need to save each block's original value before modifying it,
+    // so the next block can XOR with the pre-modification value.
+    let mut prev_block = [0u8; 64];
+    let mut current_block = [0u8; 64];
+
     for _ in 0..2 {
-        let mut temp = cache.clone();
+        // Save the last block (it's the "previous" for block 0)
+        prev_block.copy_from_slice(&cache[size - 64..size]);
+
         for i in (0..size).step_by(64) {
             let end = core::cmp::min(i + 64, size);
-            let prev_idx = if i >= 64 { i - 64 } else { size - 64 };
+            let block_len = end - i;
 
-            // XOR with previous block
-            for j in 0..(end - i) {
-                temp[i + j] ^= cache[prev_idx + j];
+            // Save current block's original value before modifying
+            current_block[..block_len].copy_from_slice(&cache[i..end]);
+
+            // XOR with previous block (using its pre-modification value)
+            for j in 0..block_len {
+                cache[i + j] ^= prev_block[j];
             }
 
             // AES round on first 16 bytes of each 64-byte block
-            if end - i >= 16 {
-                let mut state = AesState::from_bytes(&temp[i..i + 16]);
+            if block_len >= 16 {
+                let mut state = AesState::from_bytes(&cache[i..i + 16]);
                 aes_round(&mut state, &key);
-                temp[i..i + 16].copy_from_slice(&state.to_bytes());
+                cache[i..i + 16].copy_from_slice(&state.to_bytes());
             }
+
+            // Current block's original value becomes previous for next iteration
+            prev_block[..block_len].copy_from_slice(&current_block[..block_len]);
         }
-        cache = temp;
     }
 
     cache
