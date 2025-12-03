@@ -22,10 +22,10 @@ use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v15";
+const VERSION: &str = "v16";
 
 /// Number of cache segments (keep in sync with guest)
-const TEST_CACHE_SEGMENTS: usize = 4;
+const TEST_CACHE_SEGMENTS: usize = 32;
 
 // ============================================================
 // AES Implementation (must match guest exactly)

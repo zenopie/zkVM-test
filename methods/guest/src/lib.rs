@@ -16,7 +16,7 @@ pub mod randomx;
 ///   - Dockerfile.gpu-runtime (line ~74 and tag)
 ///   - deploy-akash-runtime.yaml (image tag)
 ///   - .github/workflows/docker-build-gpu-runtime.yml (tags)
-pub const VERSION: &str = "v15";
+pub const VERSION: &str = "v16";
 
 /// Cache size for Phase 1 (Argon2d initialization)
 /// Full Monero: 268435456 (256 MiB)
@@ -27,7 +27,7 @@ pub const TEST_CACHE_SIZE: usize = 134217728; // 128 MiB
 /// Higher = less memory per proof, but more proofs
 /// Set to 1 for single-proof mode (original behavior)
 /// Try: 1, 2, 4, 8, 16, 32 to find optimal split
-pub const TEST_CACHE_SEGMENTS: usize = 4;
+pub const TEST_CACHE_SEGMENTS: usize = 32;
 
 /// Scratchpad size for Phase 2 (VM execution)
 /// Full Monero: 2097152 (2 MiB)
