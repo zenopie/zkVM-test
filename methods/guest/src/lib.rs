@@ -9,40 +9,33 @@ extern crate alloc;
 pub mod randomx;
 
 // ============================================================
-// TEST CONFIGURATION - Adjust these values as needed
+// MONERO RANDOMX SPECIFICATION
 // ============================================================
 
 /// Version string - UPDATE ALSO IN:
 ///   - Dockerfile.gpu-runtime (line ~74 and tag)
 ///   - deploy-akash-runtime.yaml (image tag)
 ///   - .github/workflows/docker-build-gpu-runtime.yml (tags)
-pub const VERSION: &str = "v16";
+pub const VERSION: &str = "v18";
 
-/// Cache size for Phase 1 (Argon2d initialization)
-/// Full Monero: 268435456 (256 MiB)
-/// Current test: 134217728 (128 MiB)
-pub const TEST_CACHE_SIZE: usize = 134217728; // 128 MiB
+// ----------------- FULL MONERO SPEC -----------------
+// These are ALWAYS the full Monero spec values.
+// TEST_MODE env var only affects INPUT DATA (test block vs real block),
+// NOT the cryptographic parameters.
 
-/// Number of segments to split cache proof into
-/// Higher = less memory per proof, but more proofs
-/// Set to 1 for single-proof mode (original behavior)
-/// Try: 1, 2, 4, 8, 16, 32 to find optimal split
-pub const TEST_CACHE_SEGMENTS: usize = 32;
+/// Cache size: 256 MiB
+pub const CACHE_SIZE: usize = 268435456;
+/// Segments: 64 × 4 MiB
+pub const CACHE_SEGMENTS: usize = 64;
+/// Scratchpad: 2 MiB
+pub const SCRATCHPAD_SIZE: usize = 2097152;
+/// Programs: 8
+pub const PROGRAM_COUNT: usize = 8;
+/// Iterations: 2048
+pub const ITERATIONS: usize = 2048;
 
-/// Scratchpad size for Phase 2 (VM execution)
-/// Full Monero: 2097152 (2 MiB)
-/// Current test: 1048576 (1 MiB)
-pub const TEST_SCRATCHPAD_SIZE: usize = 1048576; // 1 MiB
-
-/// Number of RandomX programs to execute
-/// Full Monero: 8
-/// Current test: 1
-pub const TEST_PROGRAM_COUNT: usize = 1;
-
-/// Iterations per program
-/// Full Monero: 2048
-/// Current test: 1024 (half)
-pub const TEST_ITERATIONS: usize = 1024;
+/// Dataset item count (for VM execution)
+pub const RANDOMX_DATASET_ITEM_COUNT: usize = CACHE_SIZE / 64;
 
 // ============================================================
 

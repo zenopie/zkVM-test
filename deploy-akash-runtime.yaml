@@ -3,8 +3,10 @@ version: "2.0"
 
 services:
   randomx-zkvm:
-    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v16
+    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v18
     env:
+      - PROOF_MODE=block
+      - TEST_MODE=true
       - RISC0_PROVER=local
       - RUST_LOG=info,risc0_zkvm=debug,risc0_circuit_rv32im=info,risc0_prover=debug
       - RUST_BACKTRACE=full

@@ -1,12 +1,25 @@
-//! Host program for Monero RandomX zkVM verification - Two Phase Architecture
+//! Host program for Monero RandomX zkVM verification
 //!
-//! Phase 1: Cache initialization (Argon2d, 128 MiB) - Run once per ~2048 blocks
-//! Phase 2: VM execution (scratchpad + programs) - Run for each block
+//! Environment Variables:
+//!   PROOF_MODE: "cache" | "block" | "challenge" | "full" (default: "full")
+//!   - cache:     Prove full cache hash (all 64 segments) - for Pro deposits
+//!   - block:     Prove block PoW only (Phase 2) - requires cache already proven
+//!   - challenge: Prove single segment (fraud proof) - set CHALLENGE_SEGMENT=N
+//!   - full:      Prove cache + block (complete verification)
 //!
-//! The cache proof can be reused for ~2-3 days worth of blocks!
+//!   CHALLENGE_SEGMENT: 0-63 (which segment to prove for challenge mode)
+//!
+//!   TEST_MODE: "true" | "false" (default: "true")
+//!   - true:  Use test block data (dummy block header, test RandomX key)
+//!   - false: Use real input data from environment variables:
+//!     - RANDOMX_KEY: Hex-encoded 32-byte RandomX key
+//!     - HASHING_BLOB: Hex-encoded block hashing blob
+//!     - BLOCK_HEIGHT: Block height (optional, for logging)
+//!     - DIFFICULTY: Target difficulty (optional, default: 1)
+//!
+//! Monero Spec: 256 MiB cache, 2 MiB scratchpad, 8 programs, 2048 iterations
 
 use methods::{
-    PHASE1_CACHE_ELF, PHASE1_CACHE_ID,
     PHASE1A_CACHE_SEGMENT_ELF, PHASE1A_CACHE_SEGMENT_ID,
     PHASE2_VM_ELF, PHASE2_VM_ID,
 };
@@ -22,10 +35,65 @@ use blake2::{Blake2b, Digest};
 use blake2::digest::consts::U32;
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v16";
+const VERSION: &str = "v18";
 
-/// Number of cache segments (keep in sync with guest)
-const TEST_CACHE_SEGMENTS: usize = 32;
+// ============================================================
+// MONERO RANDOMX SPECIFICATION (must match guest)
+// ============================================================
+const CACHE_SIZE: usize = 268435456;  // 256 MiB
+const CACHE_SEGMENTS: usize = 64;     // 4 MiB per segment
+
+/// Proof mode from PROOF_MODE env var
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProofMode {
+    Cache,      // Prove full cache (all 64 segments)
+    Block,      // Prove block PoW only (Phase 2)
+    Challenge,  // Prove single segment (fraud proof)
+    Full,       // Both cache + block
+}
+
+impl ProofMode {
+    fn from_env() -> Self {
+        match std::env::var("PROOF_MODE").as_deref() {
+            Ok("cache") => ProofMode::Cache,
+            Ok("block") => ProofMode::Block,
+            Ok("challenge") => ProofMode::Challenge,
+            _ => ProofMode::Full,
+        }
+    }
+}
+
+/// Get challenge segment from CHALLENGE_SEGMENT env var (default: 0)
+fn get_challenge_segment() -> usize {
+    std::env::var("CHALLENGE_SEGMENT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        .min(CACHE_SEGMENTS - 1)
+}
+
+/// Check if TEST_MODE is enabled (default: true)
+fn is_test_mode() -> bool {
+    std::env::var("TEST_MODE")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true)
+}
+
+/// Get difficulty from env var (default: 1)
+fn get_difficulty() -> u64 {
+    std::env::var("DIFFICULTY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Get block height from env var (default: 0)
+fn get_block_height() -> u64 {
+    std::env::var("BLOCK_HEIGHT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
 
 // ============================================================
 // AES Implementation (must match guest exactly)
@@ -172,21 +240,7 @@ fn soft_aes_fill_scratchpad(seed: &[u8; 64], scratchpad: &mut [u8]) {
 
 // ============================================================
 
-/// Phase 1 Input
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Phase1Input {
-    pub randomx_key: [u8; 32],
-}
-
-/// Phase 1 Output
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Phase1Output {
-    pub cache_hash: [u8; 32],
-    pub cache_size: usize,
-    pub randomx_key: [u8; 32],
-}
-
-/// Phase 1a Input (Cache Segment)
+/// Phase 1 Input (Cache Segment)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Phase1aInput {
     #[serde(with = "BigArray")]
@@ -314,14 +368,82 @@ fn get_test_block() -> MoneroBlockHeader {
     }
 }
 
-/// Get the RandomX key (normally derived from block at height - height % 2048)
-fn get_randomx_key() -> [u8; 32] {
+/// Get test RandomX key (dummy key for testing)
+fn get_test_randomx_key() -> [u8; 32] {
     [
         0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
         0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
         0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
     ]
+}
+
+/// Get real block data from HASHING_BLOB env var
+fn get_real_block() -> Result<MoneroBlockHeader, String> {
+    let hashing_blob_hex = std::env::var("HASHING_BLOB")
+        .map_err(|_| "HASHING_BLOB env var not set. Set TEST_MODE=true or provide HASHING_BLOB.")?;
+
+    let hashing_blob = hex::decode(&hashing_blob_hex)
+        .map_err(|e| format!("Invalid HASHING_BLOB hex: {}", e))?;
+
+    if hashing_blob.len() < 43 {
+        return Err(format!("HASHING_BLOB too short: {} bytes (min 43)", hashing_blob.len()));
+    }
+
+    let height = get_block_height();
+    let major_version = hashing_blob.get(0).copied().unwrap_or(14);
+    let minor_version = hashing_blob.get(1).copied().unwrap_or(14);
+
+    // Extract nonce from hashing blob (bytes 39-42 typically)
+    let nonce = if hashing_blob.len() >= 43 {
+        u32::from_le_bytes([
+            hashing_blob[39], hashing_blob[40],
+            hashing_blob[41], hashing_blob[42]
+        ])
+    } else {
+        0
+    };
+
+    Ok(MoneroBlockHeader {
+        height,
+        major_version,
+        minor_version,
+        timestamp: 0, // Not critical for PoW verification
+        prev_id: [0u8; 32], // Extracted from hashing_blob if needed
+        nonce,
+        hashing_blob,
+    })
+}
+
+/// Get real RandomX key from RANDOMX_KEY env var
+fn get_real_randomx_key() -> Result<[u8; 32], String> {
+    let key_hex = std::env::var("RANDOMX_KEY")
+        .map_err(|_| "RANDOMX_KEY env var not set. Set TEST_MODE=true or provide RANDOMX_KEY.")?;
+
+    let key_bytes = hex::decode(&key_hex)
+        .map_err(|e| format!("Invalid RANDOMX_KEY hex: {}", e))?;
+
+    if key_bytes.len() != 32 {
+        return Err(format!("RANDOMX_KEY must be 32 bytes, got {}", key_bytes.len()));
+    }
+
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&key_bytes);
+    Ok(key)
+}
+
+/// Get block header and RandomX key based on TEST_MODE
+fn get_input_data() -> Result<(MoneroBlockHeader, [u8; 32], u64), String> {
+    let test_mode = is_test_mode();
+    let difficulty = get_difficulty();
+
+    if test_mode {
+        Ok((get_test_block(), get_test_randomx_key(), difficulty))
+    } else {
+        let header = get_real_block()?;
+        let key = get_real_randomx_key()?;
+        Ok((header, key, difficulty))
+    }
 }
 
 /// Compute Blake2b-256 hash
@@ -508,25 +630,43 @@ fn extract_segment_boundaries(
 }
 
 fn main() {
+    let proof_mode = ProofMode::from_env();
+    let challenge_segment = get_challenge_segment();
+    let test_mode = is_test_mode();
+
     log_separator();
-    println!("  MONERO RANDOMX ZKVM - TWO PHASE VERIFICATION");
-    println!("  Version: {} (Split Proofs)", VERSION);
+    println!("  MONERO RANDOMX ZKVM - FULL SPEC VERIFICATION");
+    println!("  Version: {}", VERSION);
     log_separator();
 
     println!();
-    log("Architecture Overview:");
-    println!("    Phase 1: Argon2d Cache Initialization");
-    println!("        - Computes cache from RandomX key");
-    println!("        - Outputs cache hash commitment");
-    println!("        - REUSABLE for ~2048 blocks (~2-3 days)!");
+    log(&format!("Proof Mode: {:?}", proof_mode));
+    log(&format!("Test Mode: {} (set TEST_MODE=false for real data)", test_mode));
+    if proof_mode == ProofMode::Challenge {
+        log(&format!("Challenge Segment: {} (set CHALLENGE_SEGMENT=0-63)", challenge_segment));
+    }
     println!();
-    println!("    Phase 2: VM Execution");
-    println!("        - Receives cache as input");
-    println!("        - Verifies cache hash matches Phase 1");
-    println!("        - Fills scratchpad, runs VM programs");
-    println!("        - Outputs final RandomX hash");
+    log("Available modes (set PROOF_MODE env var):");
+    println!("    cache     - Prove full cache hash (64 segments, ~21h)");
+    println!("    block     - Prove block PoW (Phase 2 only)");
+    println!("    challenge - Prove single segment (fraud proof, ~21min)");
+    println!("    full      - Prove cache + block (default)");
     println!();
-    println!("    (Configuration values will be shown after proof generation)");
+
+    if !test_mode {
+        log("Real data mode requires:");
+        println!("    RANDOMX_KEY:   Hex-encoded 32-byte key");
+        println!("    HASHING_BLOB:  Hex-encoded block hashing blob");
+        println!("    BLOCK_HEIGHT:  Block height (optional)");
+        println!("    DIFFICULTY:    Target difficulty (optional, default: 1)");
+        println!();
+    }
+
+    log("Monero RandomX Specification:");
+    println!("    Cache Size:      {} MiB ({} segments × 4 MiB)", CACHE_SIZE / 1_048_576, CACHE_SEGMENTS);
+    println!("    Scratchpad:      2 MiB");
+    println!("    Programs:        8");
+    println!("    Iterations:      2048");
 
     // System information
     log_separator();
@@ -554,36 +694,45 @@ fn main() {
         log("Prover Backend: CPU (set RISC0_PROVER=cuda or metal for GPU)");
     }
 
-    // Prepare test data
-    let header = get_test_block();
-    let randomx_key = get_randomx_key();
-    let difficulty: u64 = 1;
+    // Get input data (test or real based on TEST_MODE)
+    let (header, randomx_key, difficulty) = match get_input_data() {
+        Ok(data) => data,
+        Err(e) => {
+            log(&format!("ERROR: {}", e));
+            return;
+        }
+    };
 
     log_separator();
-    log("Block Information:");
+    log(&format!("Block Information ({}):", if test_mode { "TEST DATA" } else { "REAL DATA" }));
     println!("    Height: {}", header.height);
     println!("    Major Version: {} (RandomX era)", header.major_version);
     println!("    Hashing Blob: {} bytes", header.hashing_blob.len());
     println!("    RandomX Key: 0x{}...", hex::encode(&randomx_key[..8]));
-    println!("    Difficulty: {} (test mode)", difficulty);
+    println!("    Difficulty: {}", difficulty);
 
     let prover = default_prover();
     let opts = ProverOpts::default();
     let total_start = Instant::now();
 
     // =========================================================
-    // PHASE 1: Cache Initialization (Segmented or Single)
+    // PHASE 1: Cache Initialization (Segmented)
     // =========================================================
+    let run_cache = proof_mode == ProofMode::Cache || proof_mode == ProofMode::Full;
+    let run_challenge = proof_mode == ProofMode::Challenge;
+    let run_block = proof_mode == ProofMode::Block || proof_mode == ProofMode::Full;
+
     log_separator();
-    if TEST_CACHE_SEGMENTS > 1 {
-        println!("  PHASE 1: SEGMENTED CACHE PROVING ({} segments)", TEST_CACHE_SEGMENTS);
-    } else {
-        println!("  PHASE 1: CACHE INITIALIZATION");
+    match proof_mode {
+        ProofMode::Cache => println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS),
+        ProofMode::Challenge => println!("  PHASE 1: CHALLENGE MODE (segment {} only)", challenge_segment),
+        ProofMode::Block => println!("  PHASE 1: SKIPPED (PROOF_MODE=block)"),
+        ProofMode::Full => println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS),
     }
     log_separator();
 
     // First, compute cache on host (needed for both modes)
-    let cache_size: usize = 134217728; // 128 MiB - keep in sync with guest
+    let cache_size: usize = CACHE_SIZE;
     let argon2_memory_kib = (cache_size / 1024) as u32;
 
     log("Computing Argon2d seed on host...");
@@ -608,29 +757,40 @@ fn main() {
     let phase1_start = Instant::now();
     let mut phase1_cycles: u64 = 0;
 
-    if TEST_CACHE_SEGMENTS > 1 {
+    if run_cache || run_challenge {
         // =========================================================
-        // SEGMENTED PROVING MODE
+        // CACHE PROVING MODE (Full or Challenge)
         // =========================================================
         log_separator();
-        log(&format!("SEGMENTED CACHE PROVING: {} segments", TEST_CACHE_SEGMENTS));
+        if run_challenge {
+            log(&format!("CHALLENGE MODE: Proving segment {} only", challenge_segment));
+        } else {
+            log(&format!("FULL CACHE PROVING: {} segments", CACHE_SEGMENTS));
+        }
         log("Argon2d runs on HOST (publicly verifiable)");
         log("zkVM proves AES expansion for each segment");
         println!();
 
-        let segment_size = cache_size / TEST_CACHE_SEGMENTS;
+        let segment_size = cache_size / CACHE_SEGMENTS;
         log(&format!("Segment size: {} MiB ({} bytes)", segment_size / 1_048_576, segment_size));
 
         // Extract boundary states for each segment
         log("Extracting segment boundary states...");
-        let boundaries = extract_segment_boundaries(&seed, &cache, TEST_CACHE_SEGMENTS);
+        let boundaries = extract_segment_boundaries(&seed, &cache, CACHE_SEGMENTS);
         log(&format!("Extracted {} boundary states", boundaries.len()));
 
         let mut segment_hashes: Vec<[u8; 32]> = Vec::new();
 
-        for seg_idx in 0..TEST_CACHE_SEGMENTS {
+        // Determine which segments to prove
+        let segments_to_prove: Vec<usize> = if run_challenge {
+            vec![challenge_segment]
+        } else {
+            (0..CACHE_SEGMENTS).collect()
+        };
+
+        for seg_idx in segments_to_prove {
             log_separator();
-            log(&format!("SEGMENT {}/{}", seg_idx + 1, TEST_CACHE_SEGMENTS));
+            log(&format!("SEGMENT {}/{}", seg_idx + 1, CACHE_SEGMENTS));
 
             let segment_start = seg_idx * segment_size;
             let (prev_p1, prev_p2) = &boundaries[seg_idx];
@@ -638,7 +798,7 @@ fn main() {
             let phase1a_input = Phase1aInput {
                 seed,
                 segment_index: seg_idx,
-                total_segments: TEST_CACHE_SEGMENTS,
+                total_segments: CACHE_SEGMENTS,
                 segment_start,
                 segment_size,
                 total_cache_size: cache_size,
@@ -712,111 +872,50 @@ fn main() {
         }
         log("All segment hashes VERIFIED!");
 
-    } else {
-        // =========================================================
-        // SINGLE PROOF MODE (original Phase 1)
-        // =========================================================
-        log("Preparing Phase 1 input...");
-        let phase1_input = Phase1Input { randomx_key };
-        log(&format!("    RandomX Key: 0x{}...", hex::encode(&randomx_key[..8])));
-
-        log("Building Phase 1 executor environment...");
-        let phase1_env = ExecutorEnv::builder()
-            .write(&phase1_input)
-            .expect("Failed to write Phase 1 input")
-            .build()
-            .expect("Failed to build Phase 1 executor env");
-        log("Phase 1 executor environment ready");
-
-        log_separator();
-        log("PHASE 1 PROVING STARTED");
-        log("Computing Argon2d cache in zkVM...");
-        log("This phase is REUSABLE for ~2048 blocks!");
-        println!();
-
-        log("Calling prover.prove_with_ctx() for Phase 1...");
-        log("(Progress updates from prover will appear below)");
-        println!();
-
-        let phase1_result = prover.prove_with_ctx(
-            phase1_env,
-            &VerifierContext::default(),
-            PHASE1_CACHE_ELF,
-            &opts,
-        );
-
-        let phase1_info = match phase1_result {
-            Ok(info) => {
-                println!();
-                log("========================================");
-                log("PHASE 1 PROVING COMPLETED SUCCESSFULLY!");
-                log("========================================");
-                info
-            }
-            Err(e) => {
-                println!();
-                log("========================================");
-                log(&format!("ERROR: Phase 1 failed: {}", e));
-                log("========================================");
-                log("Possible causes:");
-                println!("    - Out of memory");
-                println!("    - Disk space exhausted");
-                println!("    - zkVM execution error");
-                return;
-            }
-        };
-
-        let phase1_output: Phase1Output = phase1_info.receipt.journal.decode()
-            .expect("Failed to decode Phase 1 output");
-
-        phase1_cycles = phase1_info.stats.total_cycles;
-
-        log("Phase 1 Results:");
-        println!("    Cache Hash: 0x{}", hex::encode(&phase1_output.cache_hash));
-        println!("    Cache Size: {} MiB", phase1_output.cache_size / 1_048_576);
-        println!("    Total Cycles: {}", format_number(phase1_cycles));
-
-        // Verify Phase 1 proof
-        log("Verifying Phase 1 proof...");
-        let verify1_start = Instant::now();
-        match phase1_info.receipt.verify(PHASE1_CACHE_ID) {
-            Ok(_) => {
-                log(&format!("Phase 1 proof VALID! (verified in {:.2?})", verify1_start.elapsed()));
-            }
-            Err(e) => {
-                log(&format!("ERROR: Phase 1 verification failed: {}", e));
-                return;
-            }
-        }
-
-        // Verify host cache matches Phase 1's commitment
-        if cache_hash != phase1_output.cache_hash {
-            log("ERROR: Host cache hash doesn't match Phase 1 commitment!");
-            log(&format!("    Phase 1: 0x{}", hex::encode(&phase1_output.cache_hash)));
-            log(&format!("    Host:    0x{}", hex::encode(&cache_hash)));
-            log("This indicates a bug in the cache computation!");
+        // Exit early for challenge mode
+        if run_challenge {
+            let phase1_time = phase1_start.elapsed();
+            log_separator();
+            println!("  CHALLENGE PROOF COMPLETE!");
+            log_separator();
+            log(&format!("Segment {} proven in {}", challenge_segment, format_duration(phase1_time.as_secs())));
+            log(&format!("Cycles: {}", format_number(phase1_cycles)));
+            log("This proof can be used to challenge a fraudulent cache commitment.");
+            log_separator();
             return;
         }
     }
 
     let phase1_time = phase1_start.elapsed();
 
-    log_separator();
-    log("Phase 1 Summary:");
-    println!("    Mode: {}", if TEST_CACHE_SEGMENTS > 1 { format!("Segmented ({} segments)", TEST_CACHE_SEGMENTS) } else { "Single proof".to_string() });
-    println!("    Cache Hash: 0x{}", hex::encode(&cache_hash));
-    println!("    Cache Size: {} MiB", cache_size / 1_048_576);
-    println!("    Total Cycles: {}", format_number(phase1_cycles));
-    println!("    Proving Time: {}", format_duration(phase1_time.as_secs()));
-    if phase1_time.as_secs() > 0 {
-        println!("    Throughput: {:.0} cycles/sec", phase1_cycles as f64 / phase1_time.as_secs_f64());
+    if run_cache || proof_mode == ProofMode::Full {
+        log_separator();
+        log("Phase 1 Summary:");
+        println!("    Mode: Full Cache ({} segments)", CACHE_SEGMENTS);
+        println!("    Cache Hash: 0x{}", hex::encode(&cache_hash));
+        println!("    Cache Size: {} MiB", cache_size / 1_048_576);
+        println!("    Total Cycles: {}", format_number(phase1_cycles));
+        println!("    Proving Time: {}", format_duration(phase1_time.as_secs()));
+        if phase1_time.as_secs() > 0 {
+            println!("    Throughput: {:.0} cycles/sec", phase1_cycles as f64 / phase1_time.as_secs_f64());
+        }
+    }
+
+    // Exit early for cache-only mode
+    if proof_mode == ProofMode::Cache {
+        log_separator();
+        println!("  CACHE PROOF COMPLETE!");
+        log_separator();
+        log("Full cache hash has been proven. This enables unlimited deposits.");
+        log_separator();
+        return;
     }
 
     // =========================================================
-    // PHASE 2: VM Execution
+    // PHASE 2: Block PoW Execution
     // =========================================================
     log_separator();
-    println!("  PHASE 2: VM EXECUTION");
+    println!("  PHASE 2: BLOCK POW VERIFICATION");
     log_separator();
 
     log("Preparing Phase 2 input...");

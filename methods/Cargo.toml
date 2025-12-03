@@ -7,4 +7,4 @@ edition = "2021"
 risc0-build = { workspace = true }
 
 [package.metadata.risc0]
-methods = ["guest", "phase1-cache", "phase1a-cache-segment", "phase2-vm"]
+methods = ["phase1a-cache-segment", "phase2-vm"]

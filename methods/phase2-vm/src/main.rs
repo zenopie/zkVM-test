@@ -17,7 +17,7 @@ use guest::randomx::aes::SoftAes;
 use guest::randomx::blake2b::{blake2b_256, blake2b_hash};
 use guest::randomx::program::{Program, SuperscalarProgram};
 use guest::randomx::vm::VmState;
-use guest::{RANDOMX_DATASET_ITEM_COUNT, TEST_SCRATCHPAD_SIZE, TEST_PROGRAM_COUNT, TEST_ITERATIONS};
+use guest::{RANDOMX_DATASET_ITEM_COUNT, SCRATCHPAD_SIZE, PROGRAM_COUNT, ITERATIONS};
 use risc0_zkvm::guest::env;
 use serde::{Deserialize, Serialize};
 
@@ -148,22 +148,22 @@ fn main() {
     let seed_hash = blake2b_hash(&input.input_data);
 
     // Step 4: Initialize scratchpad from seed
-    let mut scratchpad = alloc::vec![0u8; TEST_SCRATCHPAD_SIZE];
+    let mut scratchpad = alloc::vec![0u8; SCRATCHPAD_SIZE];
     SoftAes::fill_scratchpad(&seed_hash, &mut scratchpad);
 
     // Step 5: Initialize VM
-    let mut vm = VmState::new(TEST_SCRATCHPAD_SIZE);
+    let mut vm = VmState::new(SCRATCHPAD_SIZE);
     vm.scratchpad = scratchpad.clone();
 
     // Step 6: Initialize registers from seed
     let mut reg_seed = seed_hash;
 
     // Step 7: Execute VM programs
-    for program_idx in 0..TEST_PROGRAM_COUNT {
+    for program_idx in 0..PROGRAM_COUNT {
         let program = Program::generate(&reg_seed);
         vm.init(&reg_seed, &program.entropy);
 
-        for _iter in 0..TEST_ITERATIONS {
+        for _iter in 0..ITERATIONS {
             vm.execute_program(&program);
 
             // Dataset mixing (light mode)
@@ -193,7 +193,7 @@ fn main() {
 
         scratchpad = vm.scratchpad.clone();
 
-        if program_idx < TEST_PROGRAM_COUNT - 1 {
+        if program_idx < PROGRAM_COUNT - 1 {
             reg_seed = aes_hash_register_file(&vm.get_register_file());
         }
     }
@@ -222,7 +222,7 @@ fn main() {
         pow_hash,
         difficulty_valid,
         cache_size,
-        scratchpad_size: TEST_SCRATCHPAD_SIZE,
+        scratchpad_size: SCRATCHPAD_SIZE,
     };
 
     env::commit(&output);
