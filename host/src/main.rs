@@ -280,17 +280,21 @@ fn main() {
     }
 
     log_separator();
-    log("BENCHMARK COMPLETE");
+    log("BENCHMARK SUMMARY");
     println!();
-    println!("Summary:");
-    println!("    - Full RandomX hash computed inside zkVM");
-    println!("    - Argon2d cache (256 MiB) initialized");
-    println!("    - 8 programs x 2048 iterations executed");
-    println!("    - Zero-knowledge proof generated and verified");
+    println!("Configuration:");
+    println!("    Cache Size:      {} MiB", output.cache_size / 1_048_576);
+    println!("    Scratchpad Size: {} KiB", output.scratchpad_size / 1024);
     println!();
-    println!("The proof attests that:");
-    println!("    1. Block {} has valid RandomX PoW", output.height);
-    println!("    2. Hash 0x{}... meets difficulty", hex::encode(&output.pow_hash[..8]));
-    println!("    3. All computation was done correctly");
+    println!("Performance:");
+    println!("    Total Cycles:    {}", format_number(total_cycles));
+    println!("    Proving Time:    {}h {}m {}s", hours, minutes, seconds);
+    println!("    Verification:    {:.2}s", verify_start.elapsed().as_secs_f64());
+    println!("    Throughput:      {:.0} cycles/sec", total_cycles as f64 / proving_time.as_secs_f64());
+    println!();
+    println!("Proof Output:");
+    println!("    Block Height:    {}", output.height);
+    println!("    RandomX Hash:    0x{}", hex::encode(&output.pow_hash));
+    println!("    Difficulty Met:  {}", output.difficulty_valid);
     log_separator();
 }

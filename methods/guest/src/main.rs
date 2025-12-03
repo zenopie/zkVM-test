@@ -16,14 +16,14 @@ use serde::{Deserialize, Serialize};
 
 use randomx::{randomx_hash_minimal, verify_difficulty};
 
-// TESTING: Use minimal parameters to verify proving works at all
-// Real Monero uses 256 MiB cache, 2 MiB scratchpad, 8 programs, 2048 iterations
-// We use much smaller values for faster proving during debugging
-const TEST_CACHE_SIZE: usize = 1048576; // 1 MiB (vs 256 MiB)
-const TEST_SCRATCHPAD_SIZE: usize = 65536; // 64 KiB (vs 2 MiB)
+// TESTING: 1 program with full iterations and full cache/scratchpad
+// This is 8x smaller than full Monero (1 program vs 8)
+// but uses real memory sizes to test resource scaling
+const TEST_CACHE_SIZE: usize = 268435456; // 256 MiB (full Monero)
+const TEST_SCRATCHPAD_SIZE: usize = 2097152; // 2 MiB (full Monero)
 const TEST_PROGRAM_COUNT: usize = 1; // 1 (vs 8) = 8x faster
-const TEST_ITERATIONS: usize = 128; // 128 (vs 2048) = 16x faster
-// Combined: 128x fewer VM operations!
+const TEST_ITERATIONS: usize = 2048; // 2048 (full Monero)
+// 8x fewer VM operations, but full memory!
 
 risc0_zkvm::guest::entry!(main);
 

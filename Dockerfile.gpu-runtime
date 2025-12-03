@@ -70,7 +70,7 @@ set -e
 
 echo "============================================================"
 echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v10 (minimal: 1 prog, 128 iters)"
+echo "  Image Version: gpu-runtime-v11 (1 prog, full iters, full cache)"
 echo "============================================================"
 echo ""
 
