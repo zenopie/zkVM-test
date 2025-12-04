@@ -16,7 +16,7 @@ pub mod randomx;
 ///   - Dockerfile.gpu-runtime (line ~74 and tag)
 ///   - deploy-akash-runtime.yaml (image tag)
 ///   - .github/workflows/docker-build-gpu-runtime.yml (tags)
-pub const VERSION: &str = "v18";
+pub const VERSION: &str = "v19";
 
 // ----------------- FULL MONERO SPEC -----------------
 // These are ALWAYS the full Monero spec values.
@@ -51,3 +51,4 @@ pub use randomx::program::{Program, SuperscalarProgram};
 pub use randomx::scratchpad::{Cache, Scratchpad};
 pub use randomx::vm::VmState;
 pub use randomx::{randomx_hash, randomx_hash_minimal, verify_difficulty};
+pub use randomx::merkle::{MerkleProof, DatasetItemWithProof, compute_merkle_root, verify_merkle_proof};

@@ -14,6 +14,8 @@ pub mod program;
 pub mod scratchpad;
 pub mod hash;
 pub mod softfloat;
+pub mod merkle;
 
 pub use config::*;
 pub use hash::{randomx_hash, randomx_hash_with_size, randomx_hash_with_cache_size, randomx_hash_minimal, verify_difficulty};
+pub use merkle::{MerkleProof, DatasetItemWithProof, compute_merkle_root, verify_merkle_proof};

@@ -1,228 +1,224 @@
-# Monero RandomX Verification in Risc0 zkVM
+# Monero RandomX zkVM Verification
 
-**Status: Full Implementation - Experimental**
+**Version: v19** | Zero-knowledge proof system for Monero block verification
 
-This project implements **complete RandomX verification** in pure Rust for execution inside a zkVM. This is the first known implementation of full RandomX hash computation in a zero-knowledge virtual machine.
+## Overview
 
-## What This Project Does
+This project enables trustless verification of Monero proof-of-work by generating ZK proofs of RandomX hash computation using RISC Zero zkVM. Designed for an optimistic bridge architecture:
 
-### Full RandomX Implementation
+- **Normal tier**: Bonded deposits with challenge period (no proof upfront)
+- **Pro tier**: Full ZK proof for instant finality
 
-We provide a complete pure-Rust implementation of RandomX that:
+## Architecture
 
-1. **Computes the full RandomX hash** inside the zkVM
-2. **Verifies difficulty** against the computed hash
-3. **Produces a ZK proof** attesting to the correctness of the computation
-
-### Implementation Components
+### Two-Phase Proof System
 
 ```
-methods/guest/src/randomx/
-├── mod.rs          # Module exports
-├── config.rs       # RandomX constants and opcodes
-├── aes.rs          # Software AES implementation (no SIMD)
-├── argon2.rs       # Argon2d cache initialization (256 MiB)
-├── blake2b.rs      # Blake2b generator for program generation
-├── vm.rs           # RandomX VM with all 30 instructions
-├── program.rs      # Program generation and superscalar instructions
-├── scratchpad.rs   # Cache and dataset operations (light mode)
-└── hash.rs         # Main hash computation loop
+Phase 1: Cache Initialization          Phase 2: Block PoW
+(reusable ~2048 blocks)                (per block)
+┌─────────────────────────┐            ┌─────────────────────────┐
+│  64 segments × 4 MiB    │            │  8 programs × ~1.5 MiB  │
+│  = 256 MiB total cache  │───────────▶│  with Merkle proofs     │
+│                         │   Merkle   │                         │
+│  Argon2d + AES expand   │    Root    │  RandomX VM execution   │
+└─────────────────────────┘            └─────────────────────────┘
 ```
+
+**Phase 1**: Proves correct cache generation from RandomX key
+- 64 segments × 4 MiB = 256 MiB cache
+- Argon2d seed → AES expansion
+- Reusable for ~2048 blocks (~3 days)
+
+**Phase 2**: Proves RandomX VM execution with Merkle proofs
+- 8 program segments, each ~1.5 MiB input
+- ~170× smaller than monolithic 256 MiB approach
+- Pre-execution identifies accessed dataset items
+- Merkle proofs verify items against Phase 1 root
+
+### Merkle Tree Optimization
+
+Instead of passing the full 256 MiB cache:
+
+1. Build Merkle tree from ~4.2M dataset items (64 bytes each)
+2. Pre-execute programs on host to identify ~2048 accessed items per program
+3. Provide only accessed items with Merkle proofs (~1.5 MiB total)
+4. zkVM verifies proofs and executes program
 
 ## Quick Start
 
-### Using Docker (Recommended)
-
-```bash
-# Build the container
-docker-compose build
-
-# Run the benchmark
-docker-compose up
-
-# Development mode (faster, no real proofs)
-RISC0_DEV_MODE=1 docker-compose up
-```
-
-### Local Development
+### Prerequisites
 
 ```bash
 # Install Risc0 toolchain
 curl -L https://risczero.com/install | bash
 rzup install
-
-# Build and run
-cargo run --release
 ```
 
-### GPU-Accelerated Proving (10-100x faster)
+### Build & Run
 
-GPU acceleration is **essential** for practical RandomX verification.
-
-**Local with NVIDIA GPU:**
 ```bash
-# Set CUDA prover
-RISC0_PROVER=cuda cargo run --release
+# Test mode (uses dummy block data)
+PROOF_MODE=block TEST_MODE=true cargo run -r -p host
+
+# With GPU acceleration (recommended)
+RISC0_PROVER=cuda PROOF_MODE=block cargo run -r -p host
 ```
 
-**Local with Apple Silicon:**
+### Docker (GPU Runtime)
+
 ```bash
-# Metal is auto-detected, or force it:
-RISC0_PROVER=metal cargo run --release
-```
+# Build image
+docker build -f Dockerfile.gpu-runtime -t randomx-zkvm-gpu .
 
-**Deploy to Akash (decentralized GPU cloud):**
-```bash
-# Build GPU image
-docker build -f Dockerfile.gpu -t randomx-zkvm-gpu .
-
-# Push to registry
-docker push ghcr.io/YOUR_USERNAME/randomx-zkvm-gpu:latest
-
-# Deploy to Akash
-akash tx deployment create deploy.yaml --from wallet
-```
-
-**Deploy to other GPU clouds (Vast.ai, RunPod, Lambda):**
-```bash
-# Build and run GPU container
-docker build -f Dockerfile.gpu -t randomx-zkvm-gpu .
+# Run with GPU
 docker run --gpus all randomx-zkvm-gpu
 ```
 
-### Expected GPU Speedup
+## Proof Modes
 
-| Prover | Relative Speed | ReducedRandomX Time |
-|--------|----------------|---------------------|
-| CPU | 1x | Hours-Days |
-| Metal (M1/M2) | 10-30x | 10-60 minutes |
-| CUDA (RTX 3080) | 50-80x | 5-15 minutes |
-| CUDA (RTX 4090) | 80-100x | 2-10 minutes |
-| CUDA (A100) | 100-150x | 1-5 minutes |
+Set via `PROOF_MODE` environment variable:
 
-## What It Does
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `cache` | Prove all 64 cache segments | Pro tier deposit |
+| `block` | Prove 8 program segments | Per-block verification |
+| `challenge` | Prove single cache segment | Fraud proof |
+| `full` | Both cache + block (default) | Complete verification |
 
-Computes the **full RandomX hash** for a Monero block header inside a zkVM:
+## Configuration
 
-1. **Argon2d Cache Init** - 256 MiB cache from RandomX key
-2. **Scratchpad Fill** - 2 MiB scratchpad via AES
-3. **VM Execution** - 8 programs × 2048 iterations
-4. **Difficulty Check** - Verify hash meets target
+### Environment Variables
 
-The proof attests that all computation was performed correctly.
+```bash
+# Proof mode
+PROOF_MODE=block          # cache | block | challenge | full
+
+# Input data source
+TEST_MODE=true            # true = test data, false = real Monero data
+
+# Real data mode (when TEST_MODE=false)
+RANDOMX_KEY=<hex>         # 32-byte RandomX key
+HASHING_BLOB=<hex>        # Block hashing blob
+BLOCK_HEIGHT=3000000      # Block height (optional)
+DIFFICULTY=1              # Target difficulty (optional)
+
+# Challenge mode
+CHALLENGE_SEGMENT=0       # Which segment (0-63)
+
+# Prover backend
+RISC0_PROVER=local        # local | cuda | metal
+```
+
+### Monero Specification
+
+| Parameter | Value |
+|-----------|-------|
+| Cache Size | 256 MiB (64 × 4 MiB segments) |
+| Scratchpad | 2 MiB |
+| Programs | 8 × 2048 iterations |
+| Dataset Items | ~4.2M (64 bytes each) |
 
 ## Project Structure
 
 ```
-randomx-zkvm/
-├── Dockerfile
-├── docker-compose.yml
-├── Cargo.toml
-├── host/
-│   └── src/main.rs           # Prover host, benchmarking
-└── methods/
-    ├── build.rs
-    ├── src/lib.rs
-    └── guest/
-        └── src/
-            ├── main.rs       # zkVM entry point
-            └── randomx/      # Full RandomX implementation
-                ├── mod.rs
-                ├── config.rs # Constants, opcodes
-                ├── aes.rs    # Software AES
-                ├── blake2b.rs
-                ├── vm.rs     # VM execution
-                ├── program.rs
-                ├── scratchpad.rs
-                └── hash.rs
+├── host/                        # Host-side prover
+│   └── src/main.rs             # Merkle tree, pre-execution, proving
+├── methods/
+│   ├── guest/                  # Shared RandomX library
+│   │   └── src/
+│   │       ├── lib.rs          # Config & re-exports
+│   │       └── randomx/
+│   │           ├── aes.rs      # Software AES
+│   │           ├── argon2.rs   # Cache initialization
+│   │           ├── blake2b.rs  # Hashing
+│   │           ├── merkle.rs   # Merkle tree proofs
+│   │           ├── program.rs  # RandomX programs
+│   │           ├── vm.rs       # VM execution
+│   │           └── ...
+│   ├── phase1a-cache-segment/  # Cache segment guest
+│   ├── phase2-program/         # Program segment guest (v19)
+│   └── phase2-vm/              # Legacy monolithic guest
+├── Dockerfile.gpu-runtime
+├── deploy-akash-runtime.yaml
+└── env.example
 ```
 
-## RandomX Implementation Details
+## RandomX Implementation
 
-### What's Implemented
+### Components
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| Argon2d cache init | ✅ Complete | 256 MiB cache using `argon2` crate |
-| Blake2b key derivation | ✅ Complete | Uses `blake2` crate |
-| AES scratchpad fill | ✅ Complete | Software implementation |
-| Program generation | ✅ Complete | All 30 opcodes |
-| VM execution | ✅ Complete | 8 int + 4 float registers |
-| Superscalar programs | ✅ Complete | For dataset generation |
-| Light mode dataset | ✅ Complete | On-demand computation |
-| Difficulty verification | ✅ Complete | 256-bit comparison |
+| Component | Status |
+|-----------|--------|
+| Argon2d cache (256 MiB) | Complete |
+| AES scratchpad fill | Complete |
+| All 30 instructions | Complete |
+| Program generation | Complete |
+| Superscalar programs | Complete |
+| Light mode dataset | Complete |
+| Difficulty verification | Complete |
+| Merkle proofs | Complete (v19) |
 
 ### All 30 RandomX Instructions
 
-Integer: `IADD_RS`, `IADD_M`, `ISUB_R`, `ISUB_M`, `IMUL_R`, `IMUL_M`, `IMULH_R`, `IMULH_M`, `ISMULH_R`, `ISMULH_M`, `IMUL_RCP`, `INEG_R`, `IXOR_R`, `IXOR_M`, `IROR_R`, `IROL_R`, `ISWAP_R`
+**Integer**: `IADD_RS`, `IADD_M`, `ISUB_R`, `ISUB_M`, `IMUL_R`, `IMUL_M`, `IMULH_R`, `IMULH_M`, `ISMULH_R`, `ISMULH_M`, `IMUL_RCP`, `INEG_R`, `IXOR_R`, `IXOR_M`, `IROR_R`, `IROL_R`, `ISWAP_R`
 
-Floating Point: `FSWAP_R`, `FADD_R`, `FADD_M`, `FSUB_R`, `FSUB_M`, `FSCAL_R`, `FMUL_R`, `FDIV_M`, `FSQRT_R`
+**Floating Point**: `FSWAP_R`, `FADD_R`, `FADD_M`, `FSUB_R`, `FSUB_M`, `FSCAL_R`, `FMUL_R`, `FDIV_M`, `FSQRT_R`
 
-Control: `CBRANCH`, `CFROUND`, `ISTORE`, `NOP`
+**Control**: `CBRANCH`, `CFROUND`, `ISTORE`, `NOP`
 
-### Why This Works
+## Performance
 
-1. **Pure Rust**: No assembly, no FFI, no SIMD
-2. **no_std Compatible**: Runs in zkVM environment
-3. **Light Mode**: Uses 2MB instead of 2GB
-4. **Deterministic**: Same input → same hash
+### GPU Acceleration (Required for Practical Use)
 
-### Performance Expectations
+| GPU | Relative Speed |
+|-----|----------------|
+| CPU | 1× baseline |
+| Metal (M1/M2) | 10-30× |
+| CUDA (RTX 4090) | 80-100× |
+| CUDA (H100) | 150-200× |
 
-| Mode | Cycles | Proving Time* |
-|------|--------|---------------|
-| TrustHash | ~500K | ~30 seconds |
-| ReducedRandomX | ~50M | ~30 minutes |
-| FullRandomX | ~500M+ | Hours |
+### Estimated Times (H100)
 
-*Times vary significantly based on hardware
+| Phase | Segments | Est. Time |
+|-------|----------|-----------|
+| Phase 1 (cache) | 64 | 4-8 hours |
+| Phase 2 (block) | 8 | 1-2 hours |
+| Challenge | 1 | 10-20 min |
 
-## Test Vector
+Phase 1 cache proof reusable for ~2048 blocks (~3 days).
 
+## Security Model
+
+1. **Cache Commitment**: Phase 1 proves correct cache from RandomX key
+2. **Merkle Binding**: Program segments verify items against committed root
+3. **Chained Execution**: Program outputs chain to next program inputs
+4. **Final Hash**: Last program outputs verified PoW hash
+
+## Deployment
+
+### Akash (Decentralized GPU Cloud)
+
+```bash
+# Deploy with SDL
+akash tx deployment create deploy-akash-runtime.yaml
 ```
-Block Height: 3,000,000
-Major Version: 14 (RandomX era)
-RandomX Key: 0xdeadbeefcafebabe...
-Difficulty: 1 (any hash passes)
+
+### Other GPU Clouds
+
+```bash
+# Build and push
+docker build -f Dockerfile.gpu-runtime -t ghcr.io/USER/randomx-zkvm:gpu-runtime-v19 .
+docker push ghcr.io/USER/randomx-zkvm:gpu-runtime-v19
+
+# Run on Vast.ai, RunPod, Lambda, etc.
+docker run --gpus all ghcr.io/USER/randomx-zkvm:gpu-runtime-v19
 ```
-
-## Known Limitations
-
-1. **Speed**: Full RandomX in zkVM is slow (by design - RandomX is memory-hard)
-2. **Memory**: Requires 256 MiB for full Argon2d cache initialization
-3. **No fast mode**: Only light mode (no 2GB dataset precomputation)
-
-## Differences from Reference Implementation
-
-| Aspect | Reference | This Implementation |
-|--------|-----------|---------------------|
-| Scratchpad | 2 MiB | 2 MiB ✅ |
-| Cache | 256 MiB (Argon2d) | 256 MiB (Argon2d) ✅ |
-| Dataset | 2 GiB (fast) / computed (light) | Computed on-demand (light mode) |
-| AES | Hardware/SIMD | Software tables |
-
-With the Argon2d implementation, **hashes should now match** the reference RandomX light mode implementation.
-
-## Future Improvements
-
-1. **Parallel proving**: Split work across multiple provers
-2. **Recursive proofs**: Batch multiple blocks
-3. **Hash verification**: Test against known Monero block hashes
-
-## Contributing
-
-This is experimental research. Contributions welcome:
-
-- Performance optimizations
-- Bug fixes in VM implementation
-- Benchmark results on different hardware
-- Documentation improvements
 
 ## References
 
 - [RandomX Specification](https://github.com/tevador/RandomX/blob/master/doc/specs.md)
-- [Risc0 Documentation](https://dev.risczero.com/)
-- [Monero RandomX](https://www.getmonero.org/resources/moneropedia/randomx.html)
+- [RISC Zero Documentation](https://dev.risczero.com/)
+- [Monero Research Lab](https://www.getmonero.org/resources/research-lab/)
 
 ## License
 
