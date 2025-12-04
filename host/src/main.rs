@@ -40,7 +40,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v28";
+const VERSION: &str = "v29";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)

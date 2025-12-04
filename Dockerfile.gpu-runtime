@@ -122,57 +122,32 @@ if [ "\${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "\$BINARY" ]; then
     fi
 fi
 
-# Create alias and persist PATH
-mkdir -p /home/zkvm/.local/bin
-ln -sf /home/zkvm/project/target/release/host /home/zkvm/.local/bin/prover
-export PATH="/home/zkvm/.local/bin:\$PATH"
-
-# Add to .bashrc for future shell sessions (Akash shell, docker exec, etc.)
-if ! grep -q '.local/bin' /home/zkvm/.bashrc 2>/dev/null; then
-    echo 'export PATH="/home/zkvm/.local/bin:\$PATH"' >> /home/zkvm/.bashrc
-fi
-
 echo ""
 echo "============================================================"
 echo "  PROVER CLI READY"
 echo "============================================================"
 echo ""
-echo "Usage: prover <mode> [options]"
+echo "Binary: /home/zkvm/project/target/release/host"
+echo ""
+echo "Usage: /home/zkvm/project/target/release/host [mode] [options]"
 echo ""
 echo "Modes:"
 echo "  cache               Prove full cache (64 segments)"
-echo "  cache-segment <N>   Prove single cache segment (0-63)"
+echo "  cache-segment N     Prove single cache segment (0-63)"
 echo "  block               Prove full block PoW (8 programs)"
-echo "  block-segment <N>   Prove single block segment (0-255)"
+echo "  block-segment N     Prove single block segment (0-255)"
 echo "  full                Prove cache + block (default)"
 echo ""
-echo "Options:"
-echo "  --randomx-key <HEX>   32-byte RandomX key"
-echo "  --hashing-blob <HEX>  Block hashing blob"
-echo "  --difficulty <N>      Target difficulty"
-echo "  --resume              Skip existing proofs"
-echo "  --help                Show help"
-echo ""
 echo "Examples:"
-echo "  prover cache-segment 5"
-echo "  prover block-segment 42"
-echo "  prover --help"
+echo "  /home/zkvm/project/target/release/host cache-segment 5"
+echo "  /home/zkvm/project/target/release/host block-segment 42"
+echo "  /home/zkvm/project/target/release/host --help"
 echo ""
 echo "============================================================"
 echo ""
 
-# Check if running interactively
-if [ -t 0 ]; then
-    # Interactive mode: drop to shell
-    exec /bin/bash --rcfile <(echo 'export PATH="/home/zkvm/.local/bin:\$PATH"')
-else
-    # Non-interactive mode (cloud deployment): keep container alive
-    echo "Running in non-interactive mode. Container will stay alive."
-    echo "Connect via SSH or use 'docker exec' to run commands."
-    echo ""
-    # Keep container running
-    tail -f /dev/null
-fi
+# Keep container running (for Akash shell access)
+tail -f /dev/null
 EOF
 RUN chmod +x /home/zkvm/project/start.sh
 
