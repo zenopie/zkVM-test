@@ -52,6 +52,10 @@ pub struct ProgramSegmentInput {
     /// Initial register state (256 bytes) - for chunked mode mid-program
     /// Empty for iteration_start=0 (will be initialized from seed)
     pub initial_registers: Vec<u8>,
+    /// Initial mem_config.ma - for chunked mode mid-program (0 for iteration_start=0)
+    pub initial_ma: u32,
+    /// Initial mem_config.mx - for chunked mode mid-program (0 for iteration_start=0)
+    pub initial_mx: u32,
     /// Dataset items accessed by this chunk, with Merkle proofs
     pub dataset_items: Vec<DatasetItemEntry>,
     /// Target difficulty (only checked on last program)
@@ -220,9 +224,12 @@ fn main() {
         // First chunk: initialize from seed
         vm.init(&input.seed, &program.entropy);
     } else {
-        // Mid-program chunk: restore registers from input
+        // Mid-program chunk: restore registers and mem_config from input
         assert_eq!(input.initial_registers.len(), 256, "Must provide initial registers for mid-program chunk");
         restore_registers(&mut vm, &input.initial_registers);
+        // Restore mem_config.ma and mem_config.mx for correct dataset index calculation
+        vm.mem_config.ma = input.initial_ma;
+        vm.mem_config.mx = input.initial_mx;
     }
 
     // Execute the specified iteration range

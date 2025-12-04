@@ -433,6 +433,10 @@ pub struct ProgramSegmentInput {
     /// Initial register state (256 bytes) - for chunked mode mid-program
     /// Empty for iteration_start=0 (will be initialized from seed)
     pub initial_registers: Vec<u8>,
+    /// Initial mem_config.ma - for chunked mode mid-program (0 for iteration_start=0)
+    pub initial_ma: u32,
+    /// Initial mem_config.mx - for chunked mode mid-program (0 for iteration_start=0)
+    pub initial_mx: u32,
     pub dataset_items: Vec<DatasetItemEntry>,
     pub difficulty: u64,
 }
@@ -1365,6 +1369,8 @@ fn main() {
             seed: simulation.seeds[prog_idx],
             scratchpad: simulation.scratchpads[prog_idx].clone(),
             initial_registers: chunk_sim.initial_registers.clone(),
+            initial_ma: chunk_sim.initial_ma,
+            initial_mx: chunk_sim.initial_mx,
             dataset_items,
             difficulty,
         };
@@ -1563,6 +1569,8 @@ fn main() {
             seed: current_seed,
             scratchpad: current_scratchpad.to_vec(),
             initial_registers: vec![],  // Empty for iteration_start=0
+            initial_ma: 0,  // Not needed for iteration_start=0
+            initial_mx: 0,  // Not needed for iteration_start=0
             dataset_items,
             difficulty,
         };

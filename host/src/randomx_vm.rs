@@ -866,6 +866,10 @@ pub struct ChunkSimulationResult {
     pub accesses: Vec<u64>,
     /// Initial register state (256 bytes) - empty for iteration_start=0
     pub initial_registers: Vec<u8>,
+    /// Initial mem_config.ma value - needed for mid-program chunks
+    pub initial_ma: u32,
+    /// Initial mem_config.mx value - needed for mid-program chunks
+    pub initial_mx: u32,
     /// Final register state (256 bytes)
     pub final_registers: [u8; 256],
     /// Scratchpad at the end of this chunk
@@ -893,9 +897,9 @@ pub fn simulate_program_chunk(
     vm.init(seed, &program.entropy);
 
     // If this is a mid-program chunk, we need to run preceding iterations first
-    // to get the correct register state
-    let initial_registers = if iteration_start > 0 {
-        // Run iterations 0 to iteration_start to get the register state
+    // to get the correct register and mem_config state
+    let (initial_registers, initial_ma, initial_mx) = if iteration_start > 0 {
+        // Run iterations 0 to iteration_start to get the state
         for _iter in 0..iteration_start {
             vm.execute_program(&program);
 
@@ -925,10 +929,10 @@ pub fn simulate_program_chunk(
             vm.mem_config.mx ^= vm.int_regs[1] as u32;
         }
 
-        // Now capture the register state BEFORE running the target chunk
-        vm.get_register_file().to_vec()
+        // Capture register state AND mem_config BEFORE running the target chunk
+        (vm.get_register_file().to_vec(), vm.mem_config.ma, vm.mem_config.mx)
     } else {
-        vec![]
+        (vec![], 0, 0)
     };
 
     // Now run the target iteration range and collect accesses
@@ -970,6 +974,8 @@ pub fn simulate_program_chunk(
     ChunkSimulationResult {
         accesses,
         initial_registers,
+        initial_ma,
+        initial_mx,
         final_registers: vm.get_register_file(),
         final_scratchpad: vm.scratchpad,
     }
