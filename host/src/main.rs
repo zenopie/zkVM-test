@@ -1,13 +1,17 @@
 //! Host program for Monero RandomX zkVM verification
 //!
 //! Environment Variables:
-//!   PROOF_MODE: "cache" | "block" | "challenge" | "full" (default: "full")
+//!   PROOF_MODE: "cache" | "block" | "challenge" | "hashchain" | "full" (default: "full")
 //!   - cache:     Prove full cache hash (all 64 segments) - for Pro deposits
 //!   - block:     Prove block PoW only (Phase 2) - requires cache already proven
 //!   - challenge: Prove single segment (fraud proof) - set CHALLENGE_SEGMENT=N
+//!   - hashchain: Prove block header chain from anchor to tip (trivial hashing)
 //!   - full:      Prove cache + block (complete verification)
 //!
 //!   CHALLENGE_SEGMENT: 0-63 (which segment to prove for challenge mode)
+//!
+//!   HASHCHAIN_HEADERS: Comma-separated hex-encoded block headers for hash chain mode
+//!   HASHCHAIN_ANCHOR: Hex-encoded 32-byte anchor hash (proven block hash)
 //!
 //!   TEST_MODE: "true" | "false" (default: "true")
 //!   - true:  Use test block data (dummy block header, test RandomX key)
@@ -24,6 +28,7 @@ mod randomx_vm;
 use methods::{
     PHASE1A_CACHE_SEGMENT_ELF, PHASE1A_CACHE_SEGMENT_ID,
     PHASE2_PROGRAM_ELF, PHASE2_PROGRAM_ID,
+    HASH_CHAIN_ELF, HASH_CHAIN_ID,
 };
 use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, VerifierContext};
 use serde::{Deserialize, Serialize};
@@ -36,7 +41,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v22";
+const VERSION: &str = "v24";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)
@@ -54,6 +59,7 @@ enum ProofMode {
     Cache,      // Prove full cache (all 64 segments)
     Block,      // Prove block PoW (8 program segments + Merkle proofs)
     Challenge,  // Prove single segment (fraud proof)
+    HashChain,  // Prove block header chain from anchor to tip
     Full,       // Both cache + block
 }
 
@@ -63,6 +69,7 @@ impl ProofMode {
             Ok("cache") => ProofMode::Cache,
             Ok("block") => ProofMode::Block,
             Ok("challenge") => ProofMode::Challenge,
+            Ok("hashchain") => ProofMode::HashChain,
             _ => ProofMode::Full,
         }
     }
@@ -326,6 +333,22 @@ pub struct ProgramSegmentOutput {
     pub pow_hash: Option<[u8; 32]>,
     pub difficulty_valid: Option<bool>,
     pub dataset_merkle_root: [u8; 32],
+}
+
+/// Hash chain input (matches hash-chain guest)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HashChainInput {
+    pub headers: Vec<Vec<u8>>,
+    pub anchor_hash: [u8; 32],
+}
+
+/// Hash chain output (matches hash-chain guest)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HashChainOutput {
+    pub start_hash: [u8; 32],
+    pub end_hash: [u8; 32],
+    pub block_count: u64,
+    pub valid: bool,
 }
 
 /// Argon2d parameters (must match guest)
@@ -773,6 +796,163 @@ fn generate_merkle_proof(tree: &[Vec<[u8; 32]>], index: usize) -> Vec<u8> {
 // ============================================================
 // See randomx_vm module for accurate VM simulation that matches guest execution
 
+// ============================================================
+// HASH CHAIN MODE
+// ============================================================
+
+fn run_hash_chain_mode(
+    test_mode: bool,
+    prover: &impl risc0_zkvm::Prover,
+    opts: &ProverOpts,
+) {
+    log_separator();
+    println!("  HASH CHAIN VERIFICATION MODE");
+    log_separator();
+
+    // Get headers from env or use test data
+    let (headers, anchor_hash) = if test_mode {
+        log("Using test hash chain data...");
+        // Create test headers that form a valid chain
+        // Each header: [major, minor, timestamp(3), prev_id(32), ...rest]
+        let mut test_headers: Vec<Vec<u8>> = Vec::new();
+        let mut prev_hash = [0u8; 32]; // First block's prev_id
+
+        for i in 0..5 {
+            let mut header = Vec::with_capacity(76);
+            header.push(14); // major version
+            header.push(14); // minor version
+            header.extend_from_slice(&[0x86, 0xda, 0x06]); // timestamp varint
+            header.extend_from_slice(&prev_hash); // prev_id (32 bytes)
+            header.extend_from_slice(&[(i + 1) as u8; 32]); // unique nonce area
+            // Pad to typical header size
+            while header.len() < 76 {
+                header.push(0);
+            }
+            // Compute this header's hash for next iteration
+            prev_hash = blake2b_256(&header);
+            test_headers.push(header);
+        }
+
+        // Anchor hash is the hash of the first header
+        let anchor = blake2b_256(&test_headers[0]);
+        (test_headers, anchor)
+    } else {
+        // Parse HASHCHAIN_HEADERS and HASHCHAIN_ANCHOR from env
+        let headers_str = match std::env::var("HASHCHAIN_HEADERS") {
+            Ok(h) => h,
+            Err(_) => {
+                log("ERROR: HASHCHAIN_HEADERS env var not set");
+                log("       Set comma-separated hex-encoded block headers");
+                return;
+            }
+        };
+
+        let headers: Vec<Vec<u8>> = headers_str
+            .split(',')
+            .filter_map(|h| hex::decode(h.trim()).ok())
+            .collect();
+
+        if headers.is_empty() {
+            log("ERROR: No valid headers in HASHCHAIN_HEADERS");
+            return;
+        }
+
+        let anchor_hex = match std::env::var("HASHCHAIN_ANCHOR") {
+            Ok(h) => h,
+            Err(_) => {
+                log("ERROR: HASHCHAIN_ANCHOR env var not set");
+                log("       Set hex-encoded 32-byte anchor hash (proven block hash)");
+                return;
+            }
+        };
+
+        let anchor_bytes = match hex::decode(&anchor_hex) {
+            Ok(b) if b.len() == 32 => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&b);
+                arr
+            }
+            _ => {
+                log("ERROR: HASHCHAIN_ANCHOR must be 32 bytes hex-encoded");
+                return;
+            }
+        };
+
+        (headers, anchor_bytes)
+    };
+
+    log(&format!("Headers in chain: {}", headers.len()));
+    log(&format!("Anchor hash: 0x{}...", hex::encode(&anchor_hash[..8])));
+
+    // Create input for the hash chain guest
+    let input = HashChainInput {
+        headers: headers.clone(),
+        anchor_hash,
+    };
+
+    let env = ExecutorEnv::builder()
+        .write(&input)
+        .expect("Failed to write hash chain input")
+        .build()
+        .expect("Failed to build hash chain executor env");
+
+    let start = Instant::now();
+    log("Proving hash chain...");
+
+    let result = prover.prove_with_ctx(
+        env,
+        &VerifierContext::default(),
+        HASH_CHAIN_ELF,
+        opts,
+    );
+
+    let elapsed = start.elapsed();
+
+    match result {
+        Ok(info) => {
+            let output: HashChainOutput = info.receipt.journal.decode()
+                .expect("Failed to decode hash chain output");
+
+            log(&format!("Hash chain PROVED in {:.2?}", elapsed));
+            log(&format!("Cycles: {}", format_number(info.stats.total_cycles)));
+
+            // Verify proof
+            match info.receipt.verify(HASH_CHAIN_ID) {
+                Ok(_) => log("Proof VALID!"),
+                Err(e) => {
+                    log(&format!("ERROR: Verification failed: {}", e));
+                    return;
+                }
+            }
+
+            log_separator();
+            println!("  HASH CHAIN PROOF COMPLETE!");
+            log_separator();
+
+            println!();
+            log("Results:");
+            println!("    Start hash (anchor): 0x{}", hex::encode(&output.start_hash));
+            println!("    End hash (tip):      0x{}", hex::encode(&output.end_hash));
+            println!("    Block count:         {}", output.block_count);
+            println!("    Chain valid:         {}", output.valid);
+            println!();
+            log(&format!("Proving time: {:.2?}", elapsed));
+            log(&format!("Cycles: {}", format_number(info.stats.total_cycles)));
+
+            if output.valid {
+                log("SUCCESS: Chain links from anchor to tip verified!");
+            } else {
+                log("WARNING: Chain validation failed - check headers");
+            }
+        }
+        Err(e) => {
+            log(&format!("ERROR: Hash chain proof failed: {}", e));
+        }
+    }
+
+    log_separator();
+}
+
 fn main() {
     let proof_mode = ProofMode::from_env();
     let challenge_segment = get_challenge_segment();
@@ -794,6 +974,7 @@ fn main() {
     println!("    cache     - Prove full cache hash (64 segments)");
     println!("    block     - Prove block PoW (8 programs × Merkle proofs, ~1.5 MiB each)");
     println!("    challenge - Prove single cache segment (fraud proof)");
+    println!("    hashchain - Prove block header chain (anchor to tip)");
     println!("    full      - Prove cache + block (default)");
     println!();
 
@@ -838,6 +1019,18 @@ fn main() {
         log("Prover Backend: CPU (set RISC0_PROVER=cuda or metal for GPU)");
     }
 
+    let prover = default_prover();
+    let opts = ProverOpts::default();
+    let total_start = Instant::now();
+
+    // =========================================================
+    // HASH CHAIN MODE
+    // =========================================================
+    if proof_mode == ProofMode::HashChain {
+        run_hash_chain_mode(test_mode, &prover, &opts);
+        return;
+    }
+
     // Get input data (test or real based on TEST_MODE)
     let (header, randomx_key, difficulty) = match get_input_data() {
         Ok(data) => data,
@@ -855,10 +1048,6 @@ fn main() {
     println!("    RandomX Key: 0x{}...", hex::encode(&randomx_key[..8]));
     println!("    Difficulty: {}", difficulty);
 
-    let prover = default_prover();
-    let opts = ProverOpts::default();
-    let total_start = Instant::now();
-
     // =========================================================
     // PHASE 1: Cache Initialization (Segmented)
     // =========================================================
@@ -866,11 +1055,12 @@ fn main() {
     let run_challenge = proof_mode == ProofMode::Challenge;
 
     log_separator();
-    match proof_mode {
-        ProofMode::Cache => println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS),
-        ProofMode::Challenge => println!("  PHASE 1: CHALLENGE MODE (segment {} only)", challenge_segment),
-        ProofMode::Block => println!("  PHASE 1: SKIPPED (PROOF_MODE=block)"),
-        ProofMode::Full => println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS),
+    if proof_mode == ProofMode::Block {
+        println!("  PHASE 1: SKIPPED (PROOF_MODE=block)");
+    } else if proof_mode == ProofMode::Challenge {
+        println!("  PHASE 1: CHALLENGE MODE (segment {} only)", challenge_segment);
+    } else {
+        println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS);
     }
     log_separator();
 
@@ -1076,7 +1266,7 @@ fn main() {
 
     log("Simulating programs to find dataset accesses...");
     let sim_start = Instant::now();
-    let all_accesses = randomx_vm::simulate_all_programs(
+    let simulation = randomx_vm::simulate_all_programs(
         &cache,
         &header.hashing_blob,
         SCRATCHPAD_SIZE,
@@ -1084,7 +1274,7 @@ fn main() {
         RANDOMX_DATASET_ITEM_COUNT,
     );
     log(&format!("Simulation completed in {:.2?}", sim_start.elapsed()));
-    for (i, accesses) in all_accesses.iter().enumerate() {
+    for (i, accesses) in simulation.accesses.iter().enumerate() {
         let unique: std::collections::HashSet<_> = accesses.iter().collect();
         log(&format!("    Program {}: {} accesses ({} unique items)", i, accesses.len(), unique.len()));
     }
@@ -1101,16 +1291,6 @@ fn main() {
     let phase2_start = Instant::now();
     let mut phase2_cycles: u64 = 0;
 
-    // Initial seed from input data
-    let mut current_seed = [0u8; 64];
-    let input_hash = blake2b_256(&header.hashing_blob);
-    current_seed[..32].copy_from_slice(&input_hash);
-    current_seed[32..].copy_from_slice(&input_hash);
-
-    // Initial scratchpad
-    let mut current_scratchpad = vec![0u8; SCRATCHPAD_SIZE];
-    soft_aes_fill_scratchpad(&current_seed, &mut current_scratchpad);
-
     let mut final_pow_hash = [0u8; 32];
     let mut final_difficulty_valid = false;
 
@@ -1121,8 +1301,12 @@ fn main() {
         let is_first = prog_idx == 0;
         let is_last = prog_idx == PROGRAM_COUNT - 1;
 
+        // Use seed and scratchpad from simulation (CRITICAL: these match what the guest expects)
+        let current_seed = simulation.seeds[prog_idx];
+        let current_scratchpad = &simulation.scratchpads[prog_idx];
+
         // Collect unique dataset items for this program
-        let accesses = &all_accesses[prog_idx];
+        let accesses = &simulation.accesses[prog_idx];
         let unique_indices: std::collections::BTreeSet<u64> = accesses.iter().copied().collect();
 
         log(&format!("    Collecting {} unique dataset items with Merkle proofs...", unique_indices.len()));
@@ -1152,7 +1336,7 @@ fn main() {
             dataset_merkle_root: merkle_root,
             input_data: if is_first { header.hashing_blob.clone() } else { vec![] },
             seed: current_seed,
-            scratchpad: current_scratchpad.clone(),
+            scratchpad: current_scratchpad.to_vec(),
             dataset_items,
             difficulty,
         };
@@ -1200,15 +1384,8 @@ fn main() {
                     return;
                 }
 
-                // Update state for next program
-                current_seed = output.next_seed;
-
-                // For non-last programs, re-fill scratchpad from new seed
-                // In reality, the guest updates the scratchpad during execution
-                // For simplicity, we'll re-simulate
-                if !is_last {
-                    soft_aes_fill_scratchpad(&current_seed, &mut current_scratchpad);
-                }
+                // Note: We don't need to update state for next program anymore
+                // because we use the pre-computed seeds and scratchpads from the simulation
 
                 if is_last {
                     if let Some(pow_hash) = output.pow_hash {

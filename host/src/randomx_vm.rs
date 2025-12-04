@@ -761,7 +761,17 @@ fn reciprocal(divisor: u64) -> u64 {
 // PUBLIC API FOR HOST
 // ============================================================
 
-/// Simulate all 8 programs and return dataset accesses for each
+/// Result of simulating all programs
+pub struct SimulationResult {
+    /// Dataset accesses for each program (8 programs × 2048 accesses)
+    pub accesses: Vec<Vec<u64>>,
+    /// Seed at the START of each program (8 × 64 bytes)
+    pub seeds: Vec<[u8; 64]>,
+    /// Scratchpad at the START of each program (8 × 2 MiB)
+    pub scratchpads: Vec<Vec<u8>>,
+}
+
+/// Simulate all 8 programs and return dataset accesses, seeds, and scratchpads for each
 /// This must match the guest's execution exactly to predict dataset accesses
 pub fn simulate_all_programs(
     cache: &[u8],
@@ -769,8 +779,10 @@ pub fn simulate_all_programs(
     scratchpad_size: usize,
     iterations: usize,
     num_items: usize,
-) -> Vec<Vec<u64>> {
+) -> SimulationResult {
     let mut all_accesses = Vec::new();
+    let mut all_seeds = Vec::new();
+    let mut all_scratchpads = Vec::new();
 
     // Initial seed from input data (matches guest)
     let mut seed = [0u8; 64];
@@ -783,6 +795,10 @@ pub fn simulate_all_programs(
     crate::soft_aes_fill_scratchpad(&seed, &mut scratchpad);
 
     for _prog_idx in 0..RANDOMX_PROGRAM_COUNT {
+        // Save seed and scratchpad at START of this program
+        all_seeds.push(seed);
+        all_scratchpads.push(scratchpad.clone());
+
         // Generate program from seed (matches guest)
         let program = Program::generate(&seed);
 
@@ -833,11 +849,15 @@ pub fn simulate_all_programs(
         // Compute next seed using AES hash of register file (matches guest)
         seed = aes_hash_register_file(&vm.get_register_file());
 
-        // Update scratchpad for next program
+        // Update scratchpad for next program (CRITICAL: carry over modified scratchpad)
         scratchpad = vm.scratchpad;
     }
 
-    all_accesses
+    SimulationResult {
+        accesses: all_accesses,
+        seeds: all_seeds,
+        scratchpads: all_scratchpads,
+    }
 }
 
 /// AES hash of register file (matches guest)

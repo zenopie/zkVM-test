@@ -3,7 +3,7 @@ version: "2.0"
 
 services:
   randomx-zkvm:
-    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v22
+    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v24
     env:
       - PROOF_MODE=block
       - TEST_MODE=true
