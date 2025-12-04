@@ -38,6 +38,10 @@ pub struct Phase1aInput {
     /// State at start of this segment for mixing pass 2
     #[serde(with = "BigArray")]
     pub prev_block_pass2: [u8; 64],
+    /// AES states at segment start (4 states × 16 bytes each)
+    /// Pre-computed by host to avoid O(N) fast-forward in guest
+    #[serde(with = "BigArray")]
+    pub aes_states: [u8; 64],
 }
 
 /// Output from Phase 1a (Cache Segment)
@@ -72,7 +76,7 @@ fn main() {
     // Compute seed hash for commitment
     let seed_hash = blake2b_256(&input.seed);
 
-    // Expand this segment
+    // Expand this segment using pre-computed AES states
     let (segment_data, final_p1, final_p2) = expand_cache_segment(
         &input.seed,
         input.segment_start,
@@ -80,6 +84,7 @@ fn main() {
         input.total_cache_size,
         &input.prev_block_pass1,
         &input.prev_block_pass2,
+        &input.aes_states,
     );
 
     // Hash the segment for verification

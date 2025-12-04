@@ -34,7 +34,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v20";
+const VERSION: &str = "v21";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)
@@ -257,6 +257,9 @@ pub struct Phase1aInput {
     pub prev_block_pass1: [u8; 64],
     #[serde(with = "BigArray")]
     pub prev_block_pass2: [u8; 64],
+    /// Pre-computed AES states at segment boundary (4 states × 16 bytes)
+    #[serde(with = "BigArray")]
+    pub aes_states: [u8; 64],
 }
 
 /// Phase 1a Output (Cache Segment)
@@ -542,6 +545,55 @@ fn compute_argon2_seed(key: &[u8], memory_kib: u32) -> [u8; 64] {
         .hash_password_into(key, ARGON2_SALT, &mut seed)
         .expect("Argon2d hash failed");
     seed
+}
+
+/// Compute AES states at each segment boundary
+/// The AES fill produces 64 bytes per iteration (4 states × 16 bytes)
+/// Returns Vec of [u8; 64] containing 4 AES states at each segment start
+fn extract_aes_states_at_boundaries(
+    seed: &[u8; 64],
+    num_segments: usize,
+    segment_size: usize,
+) -> Vec<[u8; 64]> {
+    let keys: [[u8; 16]; 4] = [
+        [0xd7, 0x98, 0x3a, 0xad, 0x14, 0xab, 0x20, 0xdc, 0xa2, 0x9e, 0x6e, 0x02, 0x5f, 0x45, 0xb1, 0x1b],
+        [0xbb, 0x04, 0x5d, 0x78, 0x45, 0x79, 0x98, 0x50, 0xd7, 0xdf, 0x28, 0xe5, 0x32, 0xe0, 0x48, 0xa7],
+        [0xf1, 0x07, 0x59, 0xea, 0xc9, 0x72, 0x38, 0x2d, 0x67, 0x15, 0x88, 0x6c, 0x32, 0x59, 0x28, 0xab],
+        [0x76, 0x9a, 0x49, 0xf0, 0x60, 0x14, 0xb6, 0x2c, 0xa9, 0x41, 0xc8, 0x19, 0x54, 0xb6, 0x75, 0xf7],
+    ];
+
+    let mut aes_boundaries = Vec::with_capacity(num_segments);
+
+    // Initialize states from seed
+    let mut states = [
+        AesState::from_bytes(&seed[0..16]),
+        AesState::from_bytes(&seed[16..32]),
+        AesState::from_bytes(&seed[32..48]),
+        AesState::from_bytes(&seed[48..64]),
+    ];
+
+    // Each iteration produces 64 bytes
+    let iterations_per_segment = segment_size / 64;
+
+    for _seg_idx in 0..num_segments {
+        // Save states at start of this segment
+        let mut state_bytes = [0u8; 64];
+        for (i, state) in states.iter().enumerate() {
+            state_bytes[i * 16..(i + 1) * 16].copy_from_slice(&state.to_bytes());
+        }
+        aes_boundaries.push(state_bytes);
+
+        // Fast-forward through this segment
+        for _ in 0..iterations_per_segment {
+            for state in states.iter_mut() {
+                for key in keys.iter() {
+                    aes_round(state, key);
+                }
+            }
+        }
+    }
+
+    aes_boundaries
 }
 
 /// Extract boundary states for segmented proving
@@ -1006,6 +1058,11 @@ fn main() {
         let boundaries = extract_segment_boundaries(&seed, &cache, CACHE_SEGMENTS);
         log(&format!("Extracted {} boundary states", boundaries.len()));
 
+        // Extract AES states at segment boundaries (O(1) proving optimization)
+        log("Extracting AES states at segment boundaries...");
+        let aes_states = extract_aes_states_at_boundaries(&seed, CACHE_SEGMENTS, segment_size);
+        log(&format!("Extracted {} AES state sets", aes_states.len()));
+
         let mut segment_hashes: Vec<[u8; 32]> = Vec::new();
 
         // Determine which segments to prove
@@ -1031,6 +1088,7 @@ fn main() {
                 total_cache_size: cache_size,
                 prev_block_pass1: *prev_p1,
                 prev_block_pass2: *prev_p2,
+                aes_states: aes_states[seg_idx],
             };
 
             log(&format!("    Segment start: {} bytes", segment_start));

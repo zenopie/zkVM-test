@@ -107,22 +107,26 @@ pub fn compute_argon2_seed(key: &[u8], memory_kib: u32) -> [u8; 64] {
 /// prev_block_pass1 and prev_block_pass2 are the states at the START of this segment
 /// for each mixing pass. For segment 0, these are the last 64 bytes of the initial fill.
 ///
+/// aes_states contains the 4 AES states (16 bytes each = 64 bytes total) pre-computed
+/// by the host at the segment boundary, avoiding O(N) fast-forward computation.
+///
 /// Returns: (segment_data, final_prev_block_pass1, final_prev_block_pass2)
 pub fn expand_cache_segment(
     seed: &[u8; 64],
     segment_start: usize,
     segment_size: usize,
-    total_cache_size: usize,
+    _total_cache_size: usize,
     prev_block_pass1: &[u8; 64],
     prev_block_pass2: &[u8; 64],
+    aes_states: &[u8; 64],
 ) -> (Vec<u8>, [u8; 64], [u8; 64]) {
-    use crate::randomx::aes::{AesState, aes_round, SoftAes};
+    use crate::randomx::aes::{AesState, aes_round};
 
     // Allocate segment
     let mut segment = alloc::vec![0u8; segment_size];
 
-    // Fill this segment using AES (same as SoftAes::fill_scratchpad but for a range)
-    fill_scratchpad_range(seed, &mut segment, segment_start);
+    // Fill this segment using pre-computed AES states (O(1) instead of O(N))
+    fill_scratchpad_with_states(aes_states, &mut segment, segment_start);
 
     // Mixing pass 1
     let mut key = [0u8; 16];
@@ -187,7 +191,59 @@ pub fn expand_cache_segment(
     (segment, final_prev_block_p1, final_prev_block_p2)
 }
 
-/// Fill a scratchpad range from a specific offset
+/// Fill a scratchpad range using pre-computed AES states
+/// This is O(segment_size) instead of O(offset + segment_size)
+fn fill_scratchpad_with_states(aes_states: &[u8; 64], output: &mut [u8], offset: usize) {
+    use crate::randomx::aes::{AesState, aes_round};
+
+    // AES fill produces 64 bytes per iteration (4 states x 16 bytes)
+    let start_byte_in_iteration = offset % 64;
+
+    // Initialize states from pre-computed values (no fast-forward needed!)
+    let mut states = [
+        AesState::from_bytes(&aes_states[0..16]),
+        AesState::from_bytes(&aes_states[16..32]),
+        AesState::from_bytes(&aes_states[32..48]),
+        AesState::from_bytes(&aes_states[48..64]),
+    ];
+
+    let keys: [[u8; 16]; 4] = [
+        [0xd7, 0x98, 0x3a, 0xad, 0x14, 0xab, 0x20, 0xdc, 0xa2, 0x9e, 0x6e, 0x02, 0x5f, 0x45, 0xb1, 0x1b],
+        [0xbb, 0x04, 0x5d, 0x78, 0x45, 0x79, 0x98, 0x50, 0xd7, 0xdf, 0x28, 0xe5, 0x32, 0xe0, 0x48, 0xa7],
+        [0xf1, 0x07, 0x59, 0xea, 0xc9, 0x72, 0x38, 0x2d, 0x67, 0x15, 0x88, 0x6c, 0x32, 0x59, 0x28, 0xab],
+        [0x76, 0x9a, 0x49, 0xf0, 0x60, 0x14, 0xb6, 0x2c, 0xa9, 0x41, 0xc8, 0x19, 0x54, 0xb6, 0x75, 0xf7],
+    ];
+
+    // Generate output directly (no fast-forward loop!)
+    let mut out_offset = 0;
+    let mut skip_bytes = start_byte_in_iteration;
+
+    while out_offset < output.len() {
+        // Do one iteration
+        for state in states.iter_mut() {
+            for key in keys.iter() {
+                aes_round(state, key);
+            }
+        }
+
+        // Extract bytes from this iteration
+        for state in states.iter() {
+            let bytes = state.to_bytes();
+            for &b in bytes.iter() {
+                if skip_bytes > 0 {
+                    skip_bytes -= 1;
+                    continue;
+                }
+                if out_offset < output.len() {
+                    output[out_offset] = b;
+                    out_offset += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Fill a scratchpad range from a specific offset (legacy - used by init_cache)
 /// This computes what SoftAes::fill_scratchpad would produce at offset..offset+len
 fn fill_scratchpad_range(seed: &[u8; 64], output: &mut [u8], offset: usize) {
     use crate::randomx::aes::{AesState, aes_round};
@@ -237,7 +293,7 @@ fn fill_scratchpad_range(seed: &[u8; 64], output: &mut [u8], offset: usize) {
         // Extract bytes from this iteration
         for state in states.iter() {
             let bytes = state.to_bytes();
-            for (i, &b) in bytes.iter().enumerate() {
+            for &b in bytes.iter() {
                 if skip_bytes > 0 {
                     skip_bytes -= 1;
                     continue;
