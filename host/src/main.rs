@@ -31,11 +31,10 @@ use sysinfo::System;
 
 // Import argon2 for host-side cache computation
 use argon2::{Algorithm, Argon2, Params, Version};
-use blake2::{Blake2b, Digest};
-use blake2::digest::consts::U32;
+use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v19";
+const VERSION: &str = "v20";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)
@@ -468,13 +467,13 @@ fn get_input_data() -> Result<(MoneroBlockHeader, [u8; 32], u64), String> {
     }
 }
 
-/// Compute Blake2b-256 hash
+/// Compute Blake2b-256 hash (must match guest: Blake2b512 truncated to 32 bytes)
 fn blake2b_256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Blake2b::<U32>::new();
+    let mut hasher = Blake2b512::new();
     hasher.update(data);
-    let result = hasher.finalize();
+    let full: [u8; 64] = hasher.finalize().into();
     let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
+    hash.copy_from_slice(&full[..32]);
     hash
 }
 

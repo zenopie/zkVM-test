@@ -1,6 +1,6 @@
 # Monero RandomX zkVM Verification
 
-**Version: v19** | Zero-knowledge proof system for Monero block verification
+**Version: v20** | Zero-knowledge proof system for Monero block verification
 
 ## Overview
 
@@ -136,7 +136,7 @@ RISC0_PROVER=local        # local | cuda | metal
 │   │           ├── vm.rs       # VM execution
 │   │           └── ...
 │   ├── phase1a-cache-segment/  # Cache segment guest
-│   ├── phase2-program/         # Program segment guest (v19)
+│   ├── phase2-program/         # Program segment guest (v20)
 │   └── phase2-vm/              # Legacy monolithic guest
 ├── Dockerfile.gpu-runtime
 ├── deploy-akash-runtime.yaml
@@ -156,7 +156,7 @@ RISC0_PROVER=local        # local | cuda | metal
 | Superscalar programs | Complete |
 | Light mode dataset | Complete |
 | Difficulty verification | Complete |
-| Merkle proofs | Complete (v19) |
+| Merkle proofs | Complete (v20) |
 
 ### All 30 RandomX Instructions
 
@@ -207,11 +207,11 @@ akash tx deployment create deploy-akash-runtime.yaml
 
 ```bash
 # Build and push
-docker build -f Dockerfile.gpu-runtime -t ghcr.io/USER/randomx-zkvm:gpu-runtime-v19 .
-docker push ghcr.io/USER/randomx-zkvm:gpu-runtime-v19
+docker build -f Dockerfile.gpu-runtime -t ghcr.io/USER/randomx-zkvm:gpu-runtime-v20 .
+docker push ghcr.io/USER/randomx-zkvm:gpu-runtime-v20
 
 # Run on Vast.ai, RunPod, Lambda, etc.
-docker run --gpus all ghcr.io/USER/randomx-zkvm:gpu-runtime-v19
+docker run --gpus all ghcr.io/USER/randomx-zkvm:gpu-runtime-v20
 ```
 
 ## References
