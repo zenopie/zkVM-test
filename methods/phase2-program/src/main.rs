@@ -1,11 +1,13 @@
 //! Phase 2 Program Segment: Single program execution with Merkle proofs
 //!
-//! This guest executes ONE RandomX program (2048 iterations) using
-//! Merkle proofs for dataset items instead of the full cache.
+//! This guest executes a portion of a RandomX program using Merkle proofs
+//! for dataset items instead of the full cache.
 //!
-//! Input size: ~1.5 MiB (vs 256 MiB for full cache)
-//! - 2048 dataset items × 64 bytes = 128 KiB
-//! - 2048 Merkle proofs × ~22 hashes × 32 bytes = ~1.4 MiB
+//! Supports iteration ranges for finer-grained proving:
+//! - Full program: iteration_start=0, iteration_count=2048
+//! - Chunked: e.g., iteration_start=0, iteration_count=64 (32 chunks per program)
+//!
+//! With 8 programs × 32 chunks = 256 total segments for random sampling.
 
 #![no_main]
 #![no_std]
@@ -27,10 +29,14 @@ use serde::{Deserialize, Serialize};
 pub struct ProgramSegmentInput {
     /// Which program (0-7)
     pub program_index: u8,
-    /// Is this the first program? (needs to init scratchpad from input_data)
+    /// Is this the first iteration of the first program?
     pub is_first: bool,
-    /// Is this the last program? (outputs final hash instead of state)
+    /// Is this the last iteration of the last program? (outputs final hash)
     pub is_last: bool,
+    /// Starting iteration within this program (0, 64, 128, ... for chunked mode)
+    pub iteration_start: u16,
+    /// Number of iterations to execute (2048 for full, 64 for chunked)
+    pub iteration_count: u16,
     /// The RandomX key (for superscalar program generation)
     pub randomx_key: [u8; 32],
     /// Merkle root of the dataset (from cache proof)
@@ -39,16 +45,14 @@ pub struct ProgramSegmentInput {
     /// For other programs: empty
     pub input_data: Vec<u8>,
     /// Seed for this program (64 bytes)
-    /// For first program: blake2b_hash(input_data)
-    /// For other programs: output from previous program
     #[serde(with = "serde_big_array::BigArray")]
     pub seed: [u8; 64],
     /// Input scratchpad (2 MiB)
-    /// For first program: AES-filled from seed
-    /// For other programs: output from previous program
     pub scratchpad: Vec<u8>,
-    /// Dataset items accessed by this program, with Merkle proofs
-    /// Key: item index, Value: (item data, proof siblings flattened)
+    /// Initial register state (256 bytes) - for chunked mode mid-program
+    /// Empty for iteration_start=0 (will be initialized from seed)
+    pub initial_registers: Vec<u8>,
+    /// Dataset items accessed by this chunk, with Merkle proofs
     pub dataset_items: Vec<DatasetItemEntry>,
     /// Target difficulty (only checked on last program)
     pub difficulty: u64,
@@ -69,12 +73,18 @@ pub struct DatasetItemEntry {
 pub struct ProgramSegmentOutput {
     /// Program index that was executed
     pub program_index: u8,
-    /// For non-last programs: the seed for the next program
+    /// Iteration range that was executed
+    pub iteration_start: u16,
+    pub iteration_count: u16,
+    /// For end of program: the seed for the next program
+    /// For mid-program chunks: same as input seed
     #[serde(with = "serde_big_array::BigArray")]
     pub next_seed: [u8; 64],
-    /// Hash of the output scratchpad (to chain proofs without passing 2 MiB)
+    /// Hash of the output scratchpad
     pub scratchpad_hash: [u8; 32],
-    /// For last program only: the final PoW hash
+    /// Hash of output registers (for chaining chunks within a program)
+    pub register_hash: [u8; 32],
+    /// For last iteration of last program only: the final PoW hash
     pub pow_hash: Option<[u8; 32]>,
     /// For last program only: whether difficulty was met
     pub difficulty_valid: Option<bool>,
@@ -184,6 +194,11 @@ fn main() {
 
     assert!(input.program_index < 8, "Invalid program index");
     assert_eq!(input.scratchpad.len(), SCRATCHPAD_SIZE, "Invalid scratchpad size");
+    assert!(input.iteration_count > 0, "iteration_count must be > 0");
+    assert!(
+        (input.iteration_start as usize) + (input.iteration_count as usize) <= ITERATIONS,
+        "Iteration range exceeds program length"
+    );
 
     // Build verified dataset from provided items with proofs
     let dataset = VerifiedDataset::new(
@@ -197,13 +212,22 @@ fn main() {
     let mut vm = VmState::new(SCRATCHPAD_SIZE);
     vm.scratchpad = input.scratchpad.clone();
 
-    let mut reg_seed = input.seed;
+    // Generate program from seed (same for all chunks within a program)
+    let program = Program::generate(&input.seed);
 
-    // Generate and execute program
-    let program = Program::generate(&reg_seed);
-    vm.init(&reg_seed, &program.entropy);
+    // Initialize VM state based on whether this is the start of a program
+    if input.iteration_start == 0 {
+        // First chunk: initialize from seed
+        vm.init(&input.seed, &program.entropy);
+    } else {
+        // Mid-program chunk: restore registers from input
+        assert_eq!(input.initial_registers.len(), 256, "Must provide initial registers for mid-program chunk");
+        restore_registers(&mut vm, &input.initial_registers);
+    }
 
-    for _iter in 0..ITERATIONS {
+    // Execute the specified iteration range
+    let iteration_end = (input.iteration_start as usize) + (input.iteration_count as usize);
+    for _iter in (input.iteration_start as usize)..iteration_end {
         vm.execute_program(&program);
 
         // Dataset mixing
@@ -233,13 +257,19 @@ fn main() {
 
     let scratchpad = vm.scratchpad.clone();
     let scratchpad_hash = blake2b_256(&scratchpad);
+    let final_regs = vm.get_register_file();
+    let register_hash = blake2b_256(&final_regs);
 
-    // Compute next seed (AES hash of register file)
-    let next_seed = aes_hash_register_file(&vm.get_register_file());
+    // Compute next seed only if we finished the entire program (iteration_end == 2048)
+    let is_program_complete = iteration_end == ITERATIONS;
+    let next_seed = if is_program_complete {
+        aes_hash_register_file(&final_regs)
+    } else {
+        input.seed  // Same seed continues within a program
+    };
 
-    // For last program, compute final hash
-    let (pow_hash, difficulty_valid) = if input.is_last {
-        let final_regs = vm.get_register_file();
+    // For last iteration of last program, compute final hash
+    let (pow_hash, difficulty_valid) = if input.is_last && is_program_complete {
         let mut sp_hash = [0u8; 64];
         for i in 0..64 {
             sp_hash[i] = scratchpad[i % scratchpad.len()];
@@ -263,14 +293,71 @@ fn main() {
     // Commit output
     let output = ProgramSegmentOutput {
         program_index: input.program_index,
+        iteration_start: input.iteration_start,
+        iteration_count: input.iteration_count,
         next_seed,
         scratchpad_hash,
+        register_hash,
         pow_hash,
         difficulty_valid,
         dataset_merkle_root: input.dataset_merkle_root,
     };
 
     env::commit(&output);
+}
+
+/// Restore VM registers from serialized form (256 bytes)
+/// Layout: r[0..8] (64 bytes) | f[0..4] (64 bytes) | e[0..4] (64 bytes) | a[0..4] (64 bytes)
+fn restore_registers(vm: &mut VmState, regs: &[u8]) {
+    use guest::randomx::vm::FloatRegister;
+
+    // Integer registers r[0..8] - 64 bytes
+    for i in 0..8 {
+        vm.int_regs.r[i] = u64::from_le_bytes([
+            regs[i * 8], regs[i * 8 + 1], regs[i * 8 + 2], regs[i * 8 + 3],
+            regs[i * 8 + 4], regs[i * 8 + 5], regs[i * 8 + 6], regs[i * 8 + 7],
+        ]);
+    }
+    // Float registers f[0..4] - 64 bytes (starting at offset 64)
+    // Each FloatRegister has lo and hi (16 bytes total)
+    for i in 0..4 {
+        let offset = 64 + i * 16;
+        let lo = u64::from_le_bytes([
+            regs[offset], regs[offset + 1], regs[offset + 2], regs[offset + 3],
+            regs[offset + 4], regs[offset + 5], regs[offset + 6], regs[offset + 7],
+        ]);
+        let hi = u64::from_le_bytes([
+            regs[offset + 8], regs[offset + 9], regs[offset + 10], regs[offset + 11],
+            regs[offset + 12], regs[offset + 13], regs[offset + 14], regs[offset + 15],
+        ]);
+        vm.float_regs.f[i] = FloatRegister::from_u64(lo, hi);
+    }
+    // Float registers e[0..4] - 64 bytes (starting at offset 128)
+    for i in 0..4 {
+        let offset = 128 + i * 16;
+        let lo = u64::from_le_bytes([
+            regs[offset], regs[offset + 1], regs[offset + 2], regs[offset + 3],
+            regs[offset + 4], regs[offset + 5], regs[offset + 6], regs[offset + 7],
+        ]);
+        let hi = u64::from_le_bytes([
+            regs[offset + 8], regs[offset + 9], regs[offset + 10], regs[offset + 11],
+            regs[offset + 12], regs[offset + 13], regs[offset + 14], regs[offset + 15],
+        ]);
+        vm.float_regs.e[i] = FloatRegister::from_u64(lo, hi);
+    }
+    // Float registers a[0..4] - 64 bytes (starting at offset 192)
+    for i in 0..4 {
+        let offset = 192 + i * 16;
+        let lo = u64::from_le_bytes([
+            regs[offset], regs[offset + 1], regs[offset + 2], regs[offset + 3],
+            regs[offset + 4], regs[offset + 5], regs[offset + 6], regs[offset + 7],
+        ]);
+        let hi = u64::from_le_bytes([
+            regs[offset + 8], regs[offset + 9], regs[offset + 10], regs[offset + 11],
+            regs[offset + 12], regs[offset + 13], regs[offset + 14], regs[offset + 15],
+        ]);
+        vm.float_regs.a[i] = FloatRegister::from_u64(lo, hi);
+    }
 }
 
 /// AES hash of register file

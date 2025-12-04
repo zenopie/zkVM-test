@@ -860,6 +860,121 @@ pub fn simulate_all_programs(
     }
 }
 
+/// Result of simulating a single chunk (iteration range)
+pub struct ChunkSimulationResult {
+    /// Dataset accesses for this chunk
+    pub accesses: Vec<u64>,
+    /// Initial register state (256 bytes) - empty for iteration_start=0
+    pub initial_registers: Vec<u8>,
+    /// Final register state (256 bytes)
+    pub final_registers: [u8; 256],
+    /// Scratchpad at the end of this chunk
+    pub final_scratchpad: Vec<u8>,
+}
+
+/// Simulate a specific chunk (iteration range) within a program
+/// Returns dataset accesses and register states needed for proving
+pub fn simulate_program_chunk(
+    cache: &[u8],
+    seed: &[u8; 64],
+    scratchpad: &[u8],
+    iteration_start: usize,
+    iteration_count: usize,
+    num_items: usize,
+) -> ChunkSimulationResult {
+    let scratchpad_size = scratchpad.len();
+
+    // Generate program from seed (same for all chunks within a program)
+    let program = Program::generate(seed);
+
+    // Create VM and initialize
+    let mut vm = VmState::new(scratchpad_size);
+    vm.scratchpad = scratchpad.to_vec();
+    vm.init(seed, &program.entropy);
+
+    // If this is a mid-program chunk, we need to run preceding iterations first
+    // to get the correct register state
+    let initial_registers = if iteration_start > 0 {
+        // Run iterations 0 to iteration_start to get the register state
+        for _iter in 0..iteration_start {
+            vm.execute_program(&program);
+
+            // Dataset mixing
+            let item_idx = (vm.mem_config.mx as u64)
+                .wrapping_mul(vm.int_regs[0])
+                % (num_items as u64);
+
+            let item_start = (item_idx as usize) * 64;
+            let dataset_item = &cache[item_start..item_start + 64];
+
+            for i in 0..8 {
+                let val = u64::from_le_bytes([
+                    dataset_item[i * 8],
+                    dataset_item[i * 8 + 1],
+                    dataset_item[i * 8 + 2],
+                    dataset_item[i * 8 + 3],
+                    dataset_item[i * 8 + 4],
+                    dataset_item[i * 8 + 5],
+                    dataset_item[i * 8 + 6],
+                    dataset_item[i * 8 + 7],
+                ]);
+                vm.int_regs[i] ^= val;
+            }
+
+            vm.mem_config.ma ^= vm.int_regs[0] as u32;
+            vm.mem_config.mx ^= vm.int_regs[1] as u32;
+        }
+
+        // Now capture the register state BEFORE running the target chunk
+        vm.get_register_file().to_vec()
+    } else {
+        vec![]
+    };
+
+    // Now run the target iteration range and collect accesses
+    let mut accesses = Vec::new();
+    let iteration_end = iteration_start + iteration_count;
+
+    for _iter in iteration_start..iteration_end {
+        vm.execute_program(&program);
+
+        // Calculate dataset item index
+        let item_idx = (vm.mem_config.mx as u64)
+            .wrapping_mul(vm.int_regs[0])
+            % (num_items as u64);
+
+        accesses.push(item_idx);
+
+        // Get dataset item and mix into registers
+        let item_start = (item_idx as usize) * 64;
+        let dataset_item = &cache[item_start..item_start + 64];
+
+        for i in 0..8 {
+            let val = u64::from_le_bytes([
+                dataset_item[i * 8],
+                dataset_item[i * 8 + 1],
+                dataset_item[i * 8 + 2],
+                dataset_item[i * 8 + 3],
+                dataset_item[i * 8 + 4],
+                dataset_item[i * 8 + 5],
+                dataset_item[i * 8 + 6],
+                dataset_item[i * 8 + 7],
+            ]);
+            vm.int_regs[i] ^= val;
+        }
+
+        vm.mem_config.ma ^= vm.int_regs[0] as u32;
+        vm.mem_config.mx ^= vm.int_regs[1] as u32;
+    }
+
+    ChunkSimulationResult {
+        accesses,
+        initial_registers,
+        final_registers: vm.get_register_file(),
+        final_scratchpad: vm.scratchpad,
+    }
+}
+
 /// AES hash of register file (matches guest)
 fn aes_hash_register_file(regs: &[u8; 256]) -> [u8; 64] {
     // XOR all 4 64-byte chunks together

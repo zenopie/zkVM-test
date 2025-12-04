@@ -63,59 +63,40 @@ ENV RISC0_PROVER=local
 ENV RUST_LOG=info,risc0_zkvm=debug,risc0_circuit_rv32im=info,risc0_prover=debug
 ENV RUST_BACKTRACE=full
 
-# Create startup script that builds with CUDA then runs
+# Create startup script that builds with CUDA then drops to shell
 COPY --chown=zkvm:zkvm <<EOF /home/zkvm/project/start.sh
 #!/bin/bash
 set -e
 
 echo "============================================================"
-echo "  MONERO RANDOMX ZKVM - GPU RUNTIME BUILD"
-echo "  Image Version: gpu-runtime-v24 (see methods/guest/src/lib.rs VERSION)"
+echo "  MONERO RANDOMX ZKVM - GPU RUNTIME"
 echo "============================================================"
-echo ""
-echo "Architecture: Two-Phase Split Proofs"
-echo "  Phase 1: Argon2d cache init - REUSABLE for ~2048 blocks"
-echo "  Phase 2: VM execution (scratchpad fill + programs)"
-echo "  Configuration: See methods/guest/src/lib.rs for current values"
-echo ""
-
-# Environment check
-echo "=== Environment Variables ==="
-echo "RUST_LOG: \$RUST_LOG"
-echo "RISC0_PROVER: \$RISC0_PROVER"
-echo "RUST_BACKTRACE: \$RUST_BACKTRACE"
 echo ""
 
 # GPU diagnostics
 echo "=== GPU Detection ==="
 if nvidia-smi > /dev/null 2>&1; then
     nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-    echo ""
-    nvidia-smi -L
 else
-    echo "ERROR: No NVIDIA GPU detected!"
-    echo "This image requires --gpus all flag"
-    exit 1
+    echo "WARNING: No NVIDIA GPU detected!"
+    echo "This image requires --gpus all flag for GPU proving"
 fi
 echo ""
 
 # Check for libcuda.so
 echo "=== CUDA Libraries ==="
 if ldconfig -p | grep -q libcuda; then
-    echo "libcuda.so found:"
-    ldconfig -p | grep libcuda
+    echo "libcuda.so found"
 else
-    echo "WARNING: libcuda.so not in ldconfig, checking direct..."
-    find /usr -name "libcuda.so*" 2>/dev/null || echo "libcuda.so not found"
+    echo "WARNING: libcuda.so not found"
 fi
 echo ""
 
-# Build with CUDA
+# Build with CUDA if needed
 BINARY="/home/zkvm/project/target/release/host"
 if [ -f "\$BINARY" ]; then
-    echo "=== Binary already exists, checking CUDA support ==="
     if ldd "\$BINARY" | grep -q libcuda; then
-        echo "Binary has CUDA support, skipping rebuild"
+        echo "Binary ready with CUDA support"
     else
         echo "Binary lacks CUDA, rebuilding..."
         rm -rf /home/zkvm/project/target
@@ -127,54 +108,58 @@ fi
 
 if [ "\${NEEDS_BUILD:-0}" = "1" ] || [ ! -f "\$BINARY" ]; then
     echo "=== Building with CUDA support ==="
-    echo "This will take 30-60 minutes for GPU kernel compilation..."
+    echo "This will take 30-60 minutes..."
     echo ""
 
     cd /home/zkvm/project
     RUSTFLAGS="-C target-cpu=native" cargo build -F cuda -r -p host 2>&1 | tee /tmp/build.log
 
-    echo ""
-    echo "=== Build complete, verifying CUDA linkage ==="
-
     if ldd "\$BINARY" | grep -q libcuda; then
-        echo "SUCCESS: libcuda.so is linked!"
-        ldd "\$BINARY" | grep cuda
+        echo "SUCCESS: CUDA build complete"
     else
-        echo ""
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo "FATAL: libcuda.so NOT linked - CUDA compilation failed"
-        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        echo ""
-        echo "ldd output:"
-        ldd "\$BINARY"
-        echo ""
-        echo "Build log tail:"
-        tail -50 /tmp/build.log
+        echo "FATAL: CUDA compilation failed"
         exit 1
     fi
 fi
 
-echo ""
-echo "============================================================"
-echo "  Starting RandomX verification with GPU acceleration..."
-echo "============================================================"
-echo ""
-
-"\$BINARY" 2>&1 | tee /home/zkvm/project/benchmark.log
-EXIT_CODE=\$?
+# Create alias
+ln -sf /home/zkvm/project/target/release/host /home/zkvm/.local/bin/prover 2>/dev/null || \
+    mkdir -p /home/zkvm/.local/bin && ln -sf /home/zkvm/project/target/release/host /home/zkvm/.local/bin/prover
+export PATH="/home/zkvm/.local/bin:\$PATH"
 
 echo ""
 echo "============================================================"
-echo "  PROCESS COMPLETE - Exit code: \$EXIT_CODE"
-echo "  Results saved to /home/zkvm/project/benchmark.log"
-echo "  Container will stay alive until manually closed"
+echo "  PROVER CLI READY"
+echo "============================================================"
+echo ""
+echo "Usage: prover <mode> [options]"
+echo ""
+echo "Modes:"
+echo "  cache               Prove full cache (64 segments)"
+echo "  cache-segment <N>   Prove single cache segment (0-63)"
+echo "  block               Prove full block PoW (8 programs)"
+echo "  block-segment <N>   Prove single block segment (0-255)"
+echo "  full                Prove cache + block (default)"
+echo ""
+echo "Options:"
+echo "  --randomx-key <HEX>   32-byte RandomX key"
+echo "  --hashing-blob <HEX>  Block hashing blob"
+echo "  --difficulty <N>      Target difficulty"
+echo "  --resume              Skip existing proofs"
+echo "  --help                Show help"
+echo ""
+echo "Examples:"
+echo "  prover cache-segment 5"
+echo "  prover block-segment 42"
+echo "  prover --help"
+echo ""
 echo "============================================================"
 echo ""
 
-# Keep container alive so logs can be retrieved
-sleep infinity
+# Drop to interactive shell with PATH set
+exec /bin/bash --rcfile <(echo 'export PATH="/home/zkvm/.local/bin:\$PATH"')
 EOF
 RUN chmod +x /home/zkvm/project/start.sh
 
-# Run the build+benchmark automatically
+# Start with shell (no auto-proving)
 CMD ["/bin/bash", "/home/zkvm/project/start.sh"]

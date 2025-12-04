@@ -1,25 +1,23 @@
 //! Host program for Monero RandomX zkVM verification
 //!
-//! Environment Variables:
-//!   PROOF_MODE: "cache" | "block" | "challenge" | "hashchain" | "full" (default: "full")
-//!   - cache:     Prove full cache hash (all 64 segments) - for Pro deposits
-//!   - block:     Prove block PoW only (Phase 2) - requires cache already proven
-//!   - challenge: Prove single segment (fraud proof) - set CHALLENGE_SEGMENT=N
-//!   - hashchain: Prove block header chain from anchor to tip (trivial hashing)
-//!   - full:      Prove cache + block (complete verification)
+//! Usage: host <mode> [options]
 //!
-//!   CHALLENGE_SEGMENT: 0-63 (which segment to prove for challenge mode)
+//! Modes:
+//!   cache               Prove full cache hash (64 segments)
+//!   cache-segment <N>   Prove single cache segment (0-63)
+//!   block               Prove full block PoW (8 programs)
+//!   block-segment <N>   Prove single block segment (0-255)
+//!   full                Prove cache + block (default)
 //!
-//!   HASHCHAIN_HEADERS: Comma-separated hex-encoded block headers for hash chain mode
-//!   HASHCHAIN_ANCHOR: Hex-encoded 32-byte anchor hash (proven block hash)
+//! Options:
+//!   --randomx-key <HEX>   32-byte RandomX key (hex, uses test key if omitted)
+//!   --hashing-blob <HEX>  Block hashing blob (hex, uses test blob if omitted)
+//!   --difficulty <N>      Target difficulty (default: 1)
+//!   --resume              Skip segments with existing valid proofs
 //!
-//!   TEST_MODE: "true" | "false" (default: "true")
-//!   - true:  Use test block data (dummy block header, test RandomX key)
-//!   - false: Use real input data from environment variables:
-//!     - RANDOMX_KEY: Hex-encoded 32-byte RandomX key
-//!     - HASHING_BLOB: Hex-encoded block hashing blob
-//!     - BLOCK_HEIGHT: Block height (optional, for logging)
-//!     - DIFFICULTY: Target difficulty (optional, default: 1)
+//! Segment IDs:
+//!   Cache segments: 0-63 (4 MiB each)
+//!   Block segments: 0-255 (8 programs × 32 chunks)
 //!
 //! Monero Spec: 256 MiB cache, 2 MiB scratchpad, 8 programs, 2048 iterations
 
@@ -28,11 +26,12 @@ mod randomx_vm;
 use methods::{
     PHASE1A_CACHE_SEGMENT_ELF, PHASE1A_CACHE_SEGMENT_ID,
     PHASE2_PROGRAM_ELF, PHASE2_PROGRAM_ID,
-    HASH_CHAIN_ELF, HASH_CHAIN_ID,
 };
-use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, VerifierContext};
+use risc0_zkvm::{default_prover, ExecutorEnv, ProverOpts, Receipt, VerifierContext};
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
+use std::fs;
+use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
@@ -41,7 +40,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v24";
+const VERSION: &str = "v27";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)
@@ -53,58 +52,175 @@ const PROGRAM_COUNT: usize = 8;
 const ITERATIONS: usize = 2048;
 const RANDOMX_DATASET_ITEM_COUNT: usize = CACHE_SIZE / 64;  // ~4.2M items
 
-/// Proof mode from PROOF_MODE env var
-#[derive(Debug, Clone, Copy, PartialEq)]
+// ZK-Client mode constants (256 segments for random sampling)
+const CHUNKS_PER_PROGRAM: usize = 32;
+const ITERATIONS_PER_CHUNK: usize = ITERATIONS / CHUNKS_PER_PROGRAM;  // 64
+const TOTAL_SEGMENTS: usize = PROGRAM_COUNT * CHUNKS_PER_PROGRAM;  // 256
+
+/// Proof mode
+#[derive(Debug, Clone, PartialEq)]
 enum ProofMode {
-    Cache,      // Prove full cache (all 64 segments)
-    Block,      // Prove block PoW (8 program segments + Merkle proofs)
-    Challenge,  // Prove single segment (fraud proof)
-    HashChain,  // Prove block header chain from anchor to tip
-    Full,       // Both cache + block
+    Cache,                    // Prove full cache (all 64 segments)
+    CacheSegment(usize),      // Prove single cache segment (0-63)
+    Block,                    // Prove full block PoW (8 programs)
+    BlockSegment(usize),      // Prove single block segment (0-255)
+    Full,                     // Both cache + block
 }
 
-impl ProofMode {
-    fn from_env() -> Self {
-        match std::env::var("PROOF_MODE").as_deref() {
-            Ok("cache") => ProofMode::Cache,
-            Ok("block") => ProofMode::Block,
-            Ok("challenge") => ProofMode::Challenge,
-            Ok("hashchain") => ProofMode::HashChain,
-            _ => ProofMode::Full,
+/// Configuration parsed from command-line arguments
+#[derive(Debug, Clone)]
+struct Config {
+    mode: ProofMode,
+    randomx_key: Option<[u8; 32]>,
+    hashing_blob: Option<Vec<u8>>,
+    difficulty: u64,
+    resume: bool,
+}
+
+impl Config {
+    fn parse_args() -> Result<Self, String> {
+        let args: Vec<String> = std::env::args().collect();
+
+        if args.len() < 2 {
+            return Ok(Config {
+                mode: ProofMode::Full,
+                randomx_key: None,
+                hashing_blob: None,
+                difficulty: 1,
+                resume: false,
+            });
         }
+
+        let mut mode = ProofMode::Full;
+        let mut randomx_key = None;
+        let mut hashing_blob = None;
+        let mut difficulty = 1u64;
+        let mut resume = false;
+
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "cache" => mode = ProofMode::Cache,
+                "cache-segment" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("cache-segment requires a segment number (0-63)".to_string());
+                    }
+                    let seg: usize = args[i].parse()
+                        .map_err(|_| format!("Invalid segment number: {}", args[i]))?;
+                    if seg >= CACHE_SEGMENTS {
+                        return Err(format!("Cache segment must be 0-{}", CACHE_SEGMENTS - 1));
+                    }
+                    mode = ProofMode::CacheSegment(seg);
+                }
+                "block" => mode = ProofMode::Block,
+                "block-segment" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("block-segment requires a segment number (0-255)".to_string());
+                    }
+                    let seg: usize = args[i].parse()
+                        .map_err(|_| format!("Invalid segment number: {}", args[i]))?;
+                    if seg >= TOTAL_SEGMENTS {
+                        return Err(format!("Block segment must be 0-{}", TOTAL_SEGMENTS - 1));
+                    }
+                    mode = ProofMode::BlockSegment(seg);
+                }
+                "full" => mode = ProofMode::Full,
+                "--randomx-key" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--randomx-key requires a hex value".to_string());
+                    }
+                    let bytes = hex::decode(&args[i])
+                        .map_err(|e| format!("Invalid hex for randomx-key: {}", e))?;
+                    if bytes.len() != 32 {
+                        return Err(format!("randomx-key must be 32 bytes, got {}", bytes.len()));
+                    }
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    randomx_key = Some(key);
+                }
+                "--hashing-blob" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--hashing-blob requires a hex value".to_string());
+                    }
+                    let bytes = hex::decode(&args[i])
+                        .map_err(|e| format!("Invalid hex for hashing-blob: {}", e))?;
+                    if bytes.len() < 43 {
+                        return Err(format!("hashing-blob too short: {} bytes (min 43)", bytes.len()));
+                    }
+                    hashing_blob = Some(bytes);
+                }
+                "--difficulty" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("--difficulty requires a number".to_string());
+                    }
+                    difficulty = args[i].parse()
+                        .map_err(|_| format!("Invalid difficulty: {}", args[i]))?;
+                }
+                "--resume" => {
+                    resume = true;
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                arg => {
+                    return Err(format!("Unknown argument: {}", arg));
+                }
+            }
+            i += 1;
+        }
+
+        Ok(Config {
+            mode,
+            randomx_key,
+            hashing_blob,
+            difficulty,
+            resume,
+        })
+    }
+
+    fn is_test_mode(&self) -> bool {
+        self.randomx_key.is_none() && self.hashing_blob.is_none()
     }
 }
 
-/// Get challenge segment from CHALLENGE_SEGMENT env var (default: 0)
-fn get_challenge_segment() -> usize {
-    std::env::var("CHALLENGE_SEGMENT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-        .min(CACHE_SEGMENTS - 1)
+fn print_help() {
+    println!("Monero RandomX zkVM Prover");
+    println!();
+    println!("Usage: prover <mode> [options]");
+    println!();
+    println!("Modes:");
+    println!("  cache               Prove full cache hash (64 segments)");
+    println!("  cache-segment <N>   Prove single cache segment (0-63)");
+    println!("  block               Prove full block PoW (8 programs)");
+    println!("  block-segment <N>   Prove single block segment (0-255)");
+    println!("  full                Prove cache + block (default)");
+    println!();
+    println!("Options:");
+    println!("  --randomx-key <HEX>   32-byte RandomX key (uses test key if omitted)");
+    println!("  --hashing-blob <HEX>  Block hashing blob (uses test blob if omitted)");
+    println!("  --difficulty <N>      Target difficulty (default: 1)");
+    println!("  --resume              Skip segments with existing valid proofs");
+    println!("  --help, -h            Show this help");
+    println!();
+    println!("Examples:");
+    println!("  prover full                           # Full proof with test data");
+    println!("  prover cache-segment 5                # Prove cache segment 5");
+    println!("  prover block-segment 42               # Prove block segment 42");
+    println!("  prover block --randomx-key abc123...  # Full block with real key");
 }
 
-/// Check if TEST_MODE is enabled (default: true)
-fn is_test_mode() -> bool {
-    std::env::var("TEST_MODE")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true)
-}
-
-/// Get difficulty from env var (default: 1)
-fn get_difficulty() -> u64 {
-    std::env::var("DIFFICULTY")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-}
-
-/// Get block height from env var (default: 0)
-fn get_block_height() -> u64 {
-    std::env::var("BLOCK_HEIGHT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// Convert segment ID (0-255) to program index and iteration range
+fn segment_to_params(segment_id: usize) -> (usize, usize, usize) {
+    let program_index = segment_id / CHUNKS_PER_PROGRAM;
+    let chunk_index = segment_id % CHUNKS_PER_PROGRAM;
+    let iteration_start = chunk_index * ITERATIONS_PER_CHUNK;
+    (program_index, iteration_start, ITERATIONS_PER_CHUNK)
 }
 
 // ============================================================
@@ -304,12 +420,19 @@ pub struct ProgramSegmentInput {
     pub program_index: u8,
     pub is_first: bool,
     pub is_last: bool,
+    /// Starting iteration within this program (0, 64, 128, ... for chunked mode)
+    pub iteration_start: u16,
+    /// Number of iterations to execute (2048 for full, 64 for chunked)
+    pub iteration_count: u16,
     pub randomx_key: [u8; 32],
     pub dataset_merkle_root: [u8; 32],
     pub input_data: Vec<u8>,
     #[serde(with = "BigArray")]
     pub seed: [u8; 64],
     pub scratchpad: Vec<u8>,
+    /// Initial register state (256 bytes) - for chunked mode mid-program
+    /// Empty for iteration_start=0 (will be initialized from seed)
+    pub initial_registers: Vec<u8>,
     pub dataset_items: Vec<DatasetItemEntry>,
     pub difficulty: u64,
 }
@@ -327,28 +450,17 @@ pub struct DatasetItemEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProgramSegmentOutput {
     pub program_index: u8,
+    /// Iteration range that was executed
+    pub iteration_start: u16,
+    pub iteration_count: u16,
     #[serde(with = "BigArray")]
     pub next_seed: [u8; 64],
     pub scratchpad_hash: [u8; 32],
+    /// Hash of output registers (for chaining chunks within a program)
+    pub register_hash: [u8; 32],
     pub pow_hash: Option<[u8; 32]>,
     pub difficulty_valid: Option<bool>,
     pub dataset_merkle_root: [u8; 32],
-}
-
-/// Hash chain input (matches hash-chain guest)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HashChainInput {
-    pub headers: Vec<Vec<u8>>,
-    pub anchor_hash: [u8; 32],
-}
-
-/// Hash chain output (matches hash-chain guest)
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HashChainOutput {
-    pub start_hash: [u8; 32],
-    pub end_hash: [u8; 32],
-    pub block_count: u64,
-    pub valid: bool,
 }
 
 /// Argon2d parameters (must match guest)
@@ -394,6 +506,76 @@ fn format_duration(secs: u64) -> String {
     format!("{}h {}m {}s", hours, minutes, seconds)
 }
 
+// ============================================================
+// PROOF PERSISTENCE (to avoid OOM during long proving runs)
+// ============================================================
+
+const PROOFS_DIR: &str = "proofs";
+
+/// Ensure proofs directory exists
+fn ensure_proofs_dir() {
+    if !Path::new(PROOFS_DIR).exists() {
+        fs::create_dir_all(PROOFS_DIR).expect("Failed to create proofs directory");
+    }
+}
+
+/// Save a receipt to disk
+fn save_receipt(name: &str, receipt: &Receipt) -> std::io::Result<()> {
+    ensure_proofs_dir();
+    let path = format!("{}/{}.bin", PROOFS_DIR, name);
+    let bytes = bincode::serialize(receipt).expect("Failed to serialize receipt");
+    fs::write(&path, bytes)?;
+    log(&format!("    Saved proof to {}", path));
+    Ok(())
+}
+
+/// Load a receipt from disk
+fn load_receipt(name: &str) -> Option<Receipt> {
+    let path = format!("{}/{}.bin", PROOFS_DIR, name);
+    if Path::new(&path).exists() {
+        match fs::read(&path) {
+            Ok(bytes) => {
+                match bincode::deserialize(&bytes) {
+                    Ok(receipt) => Some(receipt),
+                    Err(e) => {
+                        log(&format!("    Warning: Failed to deserialize {}: {}", path, e));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("    Warning: Failed to read {}: {}", path, e));
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+/// Check if a valid proof exists for a segment
+fn has_valid_segment_proof(seg_idx: usize) -> bool {
+    let name = format!("cache_segment_{:02}", seg_idx);
+    if let Some(receipt) = load_receipt(&name) {
+        // Verify the receipt is valid
+        if receipt.verify(PHASE1A_CACHE_SEGMENT_ID).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a valid proof exists for a program
+fn has_valid_program_proof(prog_idx: usize) -> bool {
+    let name = format!("program_{}", prog_idx);
+    if let Some(receipt) = load_receipt(&name) {
+        if receipt.verify(PHASE2_PROGRAM_ID).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Get test block data (Monero block 3,000,000)
 fn get_test_block() -> MoneroBlockHeader {
     let mut hashing_blob = Vec::with_capacity(76);
@@ -427,72 +609,32 @@ fn get_test_randomx_key() -> [u8; 32] {
     ]
 }
 
-/// Get real block data from HASHING_BLOB env var
-fn get_real_block() -> Result<MoneroBlockHeader, String> {
-    let hashing_blob_hex = std::env::var("HASHING_BLOB")
-        .map_err(|_| "HASHING_BLOB env var not set. Set TEST_MODE=true or provide HASHING_BLOB.")?;
+/// Get block header and RandomX key from config
+fn get_input_data(config: &Config) -> (MoneroBlockHeader, [u8; 32], u64) {
+    let randomx_key = config.randomx_key.unwrap_or_else(get_test_randomx_key);
 
-    let hashing_blob = hex::decode(&hashing_blob_hex)
-        .map_err(|e| format!("Invalid HASHING_BLOB hex: {}", e))?;
-
-    if hashing_blob.len() < 43 {
-        return Err(format!("HASHING_BLOB too short: {} bytes (min 43)", hashing_blob.len()));
-    }
-
-    let height = get_block_height();
-    let major_version = hashing_blob.get(0).copied().unwrap_or(14);
-    let minor_version = hashing_blob.get(1).copied().unwrap_or(14);
-
-    // Extract nonce from hashing blob (bytes 39-42 typically)
-    let nonce = if hashing_blob.len() >= 43 {
-        u32::from_le_bytes([
-            hashing_blob[39], hashing_blob[40],
-            hashing_blob[41], hashing_blob[42]
-        ])
+    let header = if let Some(ref blob) = config.hashing_blob {
+        let major_version = blob.get(0).copied().unwrap_or(14);
+        let minor_version = blob.get(1).copied().unwrap_or(14);
+        let nonce = if blob.len() >= 43 {
+            u32::from_le_bytes([blob[39], blob[40], blob[41], blob[42]])
+        } else {
+            0
+        };
+        MoneroBlockHeader {
+            height: 0,
+            major_version,
+            minor_version,
+            timestamp: 0,
+            prev_id: [0u8; 32],
+            nonce,
+            hashing_blob: blob.clone(),
+        }
     } else {
-        0
+        get_test_block()
     };
 
-    Ok(MoneroBlockHeader {
-        height,
-        major_version,
-        minor_version,
-        timestamp: 0, // Not critical for PoW verification
-        prev_id: [0u8; 32], // Extracted from hashing_blob if needed
-        nonce,
-        hashing_blob,
-    })
-}
-
-/// Get real RandomX key from RANDOMX_KEY env var
-fn get_real_randomx_key() -> Result<[u8; 32], String> {
-    let key_hex = std::env::var("RANDOMX_KEY")
-        .map_err(|_| "RANDOMX_KEY env var not set. Set TEST_MODE=true or provide RANDOMX_KEY.")?;
-
-    let key_bytes = hex::decode(&key_hex)
-        .map_err(|e| format!("Invalid RANDOMX_KEY hex: {}", e))?;
-
-    if key_bytes.len() != 32 {
-        return Err(format!("RANDOMX_KEY must be 32 bytes, got {}", key_bytes.len()));
-    }
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&key_bytes);
-    Ok(key)
-}
-
-/// Get block header and RandomX key based on TEST_MODE
-fn get_input_data() -> Result<(MoneroBlockHeader, [u8; 32], u64), String> {
-    let test_mode = is_test_mode();
-    let difficulty = get_difficulty();
-
-    if test_mode {
-        Ok((get_test_block(), get_test_randomx_key(), difficulty))
-    } else {
-        let header = get_real_block()?;
-        let key = get_real_randomx_key()?;
-        Ok((header, key, difficulty))
-    }
+    (header, randomx_key, config.difficulty)
 }
 
 /// Compute Blake2b-256 hash (must match guest: Blake2b512 truncated to 32 bytes)
@@ -796,167 +938,16 @@ fn generate_merkle_proof(tree: &[Vec<[u8; 32]>], index: usize) -> Vec<u8> {
 // ============================================================
 // See randomx_vm module for accurate VM simulation that matches guest execution
 
-// ============================================================
-// HASH CHAIN MODE
-// ============================================================
-
-fn run_hash_chain_mode(
-    test_mode: bool,
-    prover: &impl risc0_zkvm::Prover,
-    opts: &ProverOpts,
-) {
-    log_separator();
-    println!("  HASH CHAIN VERIFICATION MODE");
-    log_separator();
-
-    // Get headers from env or use test data
-    let (headers, anchor_hash) = if test_mode {
-        log("Using test hash chain data...");
-        // Create test headers that form a valid chain
-        // Each header: [major, minor, timestamp(3), prev_id(32), ...rest]
-        let mut test_headers: Vec<Vec<u8>> = Vec::new();
-        let mut prev_hash = [0u8; 32]; // First block's prev_id
-
-        for i in 0..5 {
-            let mut header = Vec::with_capacity(76);
-            header.push(14); // major version
-            header.push(14); // minor version
-            header.extend_from_slice(&[0x86, 0xda, 0x06]); // timestamp varint
-            header.extend_from_slice(&prev_hash); // prev_id (32 bytes)
-            header.extend_from_slice(&[(i + 1) as u8; 32]); // unique nonce area
-            // Pad to typical header size
-            while header.len() < 76 {
-                header.push(0);
-            }
-            // Compute this header's hash for next iteration
-            prev_hash = blake2b_256(&header);
-            test_headers.push(header);
-        }
-
-        // Anchor hash is the hash of the first header
-        let anchor = blake2b_256(&test_headers[0]);
-        (test_headers, anchor)
-    } else {
-        // Parse HASHCHAIN_HEADERS and HASHCHAIN_ANCHOR from env
-        let headers_str = match std::env::var("HASHCHAIN_HEADERS") {
-            Ok(h) => h,
-            Err(_) => {
-                log("ERROR: HASHCHAIN_HEADERS env var not set");
-                log("       Set comma-separated hex-encoded block headers");
-                return;
-            }
-        };
-
-        let headers: Vec<Vec<u8>> = headers_str
-            .split(',')
-            .filter_map(|h| hex::decode(h.trim()).ok())
-            .collect();
-
-        if headers.is_empty() {
-            log("ERROR: No valid headers in HASHCHAIN_HEADERS");
-            return;
-        }
-
-        let anchor_hex = match std::env::var("HASHCHAIN_ANCHOR") {
-            Ok(h) => h,
-            Err(_) => {
-                log("ERROR: HASHCHAIN_ANCHOR env var not set");
-                log("       Set hex-encoded 32-byte anchor hash (proven block hash)");
-                return;
-            }
-        };
-
-        let anchor_bytes = match hex::decode(&anchor_hex) {
-            Ok(b) if b.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&b);
-                arr
-            }
-            _ => {
-                log("ERROR: HASHCHAIN_ANCHOR must be 32 bytes hex-encoded");
-                return;
-            }
-        };
-
-        (headers, anchor_bytes)
-    };
-
-    log(&format!("Headers in chain: {}", headers.len()));
-    log(&format!("Anchor hash: 0x{}...", hex::encode(&anchor_hash[..8])));
-
-    // Create input for the hash chain guest
-    let input = HashChainInput {
-        headers: headers.clone(),
-        anchor_hash,
-    };
-
-    let env = ExecutorEnv::builder()
-        .write(&input)
-        .expect("Failed to write hash chain input")
-        .build()
-        .expect("Failed to build hash chain executor env");
-
-    let start = Instant::now();
-    log("Proving hash chain...");
-
-    let result = prover.prove_with_ctx(
-        env,
-        &VerifierContext::default(),
-        HASH_CHAIN_ELF,
-        opts,
-    );
-
-    let elapsed = start.elapsed();
-
-    match result {
-        Ok(info) => {
-            let output: HashChainOutput = info.receipt.journal.decode()
-                .expect("Failed to decode hash chain output");
-
-            log(&format!("Hash chain PROVED in {:.2?}", elapsed));
-            log(&format!("Cycles: {}", format_number(info.stats.total_cycles)));
-
-            // Verify proof
-            match info.receipt.verify(HASH_CHAIN_ID) {
-                Ok(_) => log("Proof VALID!"),
-                Err(e) => {
-                    log(&format!("ERROR: Verification failed: {}", e));
-                    return;
-                }
-            }
-
-            log_separator();
-            println!("  HASH CHAIN PROOF COMPLETE!");
-            log_separator();
-
-            println!();
-            log("Results:");
-            println!("    Start hash (anchor): 0x{}", hex::encode(&output.start_hash));
-            println!("    End hash (tip):      0x{}", hex::encode(&output.end_hash));
-            println!("    Block count:         {}", output.block_count);
-            println!("    Chain valid:         {}", output.valid);
-            println!();
-            log(&format!("Proving time: {:.2?}", elapsed));
-            log(&format!("Cycles: {}", format_number(info.stats.total_cycles)));
-
-            if output.valid {
-                log("SUCCESS: Chain links from anchor to tip verified!");
-            } else {
-                log("WARNING: Chain validation failed - check headers");
-            }
-        }
-        Err(e) => {
-            log(&format!("ERROR: Hash chain proof failed: {}", e));
-        }
-    }
-
-    log_separator();
-}
-
 fn main() {
-    let proof_mode = ProofMode::from_env();
-    let challenge_segment = get_challenge_segment();
-    let test_mode = is_test_mode();
+    // Parse command-line arguments
+    let config = match Config::parse_args() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!("Run with --help for usage");
+            std::process::exit(1);
+        }
+    };
 
     log_separator();
     println!("  MONERO RANDOMX ZKVM - FULL SPEC VERIFICATION");
@@ -964,28 +955,12 @@ fn main() {
     log_separator();
 
     println!();
-    log(&format!("Proof Mode: {:?}", proof_mode));
-    log(&format!("Test Mode: {} (set TEST_MODE=false for real data)", test_mode));
-    if proof_mode == ProofMode::Challenge {
-        log(&format!("Challenge Segment: {} (set CHALLENGE_SEGMENT=0-63)", challenge_segment));
+    log(&format!("Proof Mode: {:?}", config.mode));
+    log(&format!("Test Mode: {}", config.is_test_mode()));
+    if config.resume {
+        log("Resume Mode: enabled");
     }
     println!();
-    log("Available modes (set PROOF_MODE env var):");
-    println!("    cache     - Prove full cache hash (64 segments)");
-    println!("    block     - Prove block PoW (8 programs × Merkle proofs, ~1.5 MiB each)");
-    println!("    challenge - Prove single cache segment (fraud proof)");
-    println!("    hashchain - Prove block header chain (anchor to tip)");
-    println!("    full      - Prove cache + block (default)");
-    println!();
-
-    if !test_mode {
-        log("Real data mode requires:");
-        println!("    RANDOMX_KEY:   Hex-encoded 32-byte key");
-        println!("    HASHING_BLOB:  Hex-encoded block hashing blob");
-        println!("    BLOCK_HEIGHT:  Block height (optional)");
-        println!("    DIFFICULTY:    Target difficulty (optional, default: 1)");
-        println!();
-    }
 
     log("Monero RandomX Specification:");
     println!("    Cache Size:      {} MiB ({} segments × 4 MiB)", CACHE_SIZE / 1_048_576, CACHE_SEGMENTS);
@@ -1023,25 +998,11 @@ fn main() {
     let opts = ProverOpts::default();
     let total_start = Instant::now();
 
-    // =========================================================
-    // HASH CHAIN MODE
-    // =========================================================
-    if proof_mode == ProofMode::HashChain {
-        run_hash_chain_mode(test_mode, &prover, &opts);
-        return;
-    }
-
-    // Get input data (test or real based on TEST_MODE)
-    let (header, randomx_key, difficulty) = match get_input_data() {
-        Ok(data) => data,
-        Err(e) => {
-            log(&format!("ERROR: {}", e));
-            return;
-        }
-    };
+    // Get input data from config
+    let (header, randomx_key, difficulty) = get_input_data(&config);
 
     log_separator();
-    log(&format!("Block Information ({}):", if test_mode { "TEST DATA" } else { "REAL DATA" }));
+    log(&format!("Block Information ({}):", if config.is_test_mode() { "TEST DATA" } else { "REAL DATA" }));
     println!("    Height: {}", header.height);
     println!("    Major Version: {} (RandomX era)", header.major_version);
     println!("    Hashing Blob: {} bytes", header.hashing_blob.len());
@@ -1051,16 +1012,20 @@ fn main() {
     // =========================================================
     // PHASE 1: Cache Initialization (Segmented)
     // =========================================================
-    let run_cache = proof_mode == ProofMode::Cache || proof_mode == ProofMode::Full;
-    let run_challenge = proof_mode == ProofMode::Challenge;
+    let run_cache = matches!(config.mode, ProofMode::Cache | ProofMode::Full);
+    let run_cache_segment = matches!(config.mode, ProofMode::CacheSegment(_));
 
     log_separator();
-    if proof_mode == ProofMode::Block {
-        println!("  PHASE 1: SKIPPED (PROOF_MODE=block)");
-    } else if proof_mode == ProofMode::Challenge {
-        println!("  PHASE 1: CHALLENGE MODE (segment {} only)", challenge_segment);
-    } else {
-        println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS);
+    match &config.mode {
+        ProofMode::Block | ProofMode::BlockSegment(_) => {
+            println!("  PHASE 1: SKIPPED (block mode)");
+        }
+        ProofMode::CacheSegment(seg) => {
+            println!("  PHASE 1: SINGLE CACHE SEGMENT (segment {})", seg);
+        }
+        _ => {
+            println!("  PHASE 1: FULL CACHE PROVING ({} segments)", CACHE_SEGMENTS);
+        }
     }
     log_separator();
 
@@ -1090,13 +1055,13 @@ fn main() {
     let phase1_start = Instant::now();
     let mut phase1_cycles: u64 = 0;
 
-    if run_cache || run_challenge {
+    if run_cache || run_cache_segment {
         // =========================================================
-        // CACHE PROVING MODE (Full or Challenge)
+        // CACHE PROVING MODE (Full or Single Segment)
         // =========================================================
         log_separator();
-        if run_challenge {
-            log(&format!("CHALLENGE MODE: Proving segment {} only", challenge_segment));
+        if let ProofMode::CacheSegment(seg) = &config.mode {
+            log(&format!("SINGLE SEGMENT MODE: Proving cache segment {} only", seg));
         } else {
             log(&format!("FULL CACHE PROVING: {} segments", CACHE_SEGMENTS));
         }
@@ -1120,15 +1085,52 @@ fn main() {
         let mut segment_hashes: Vec<[u8; 32]> = Vec::new();
 
         // Determine which segments to prove
-        let segments_to_prove: Vec<usize> = if run_challenge {
-            vec![challenge_segment]
+        let segments_to_prove: Vec<usize> = if let ProofMode::CacheSegment(seg) = &config.mode {
+            vec![*seg]
         } else {
             (0..CACHE_SEGMENTS).collect()
         };
 
+        // Check for existing proofs (only if resume mode enabled)
+        if config.resume {
+            let mut existing_count = 0;
+            for &seg_idx in &segments_to_prove {
+                if has_valid_segment_proof(seg_idx) {
+                    existing_count += 1;
+                }
+            }
+            if existing_count > 0 {
+                log(&format!("RESUME MODE: Found {} existing valid proofs in {}/", existing_count, PROOFS_DIR));
+                log("Will skip already-proven segments");
+            }
+        }
+
         for seg_idx in segments_to_prove {
             log_separator();
             log(&format!("SEGMENT {}/{}", seg_idx + 1, CACHE_SEGMENTS));
+
+            // Check if this segment was already proven (only if resume mode enabled)
+            let proof_name = format!("cache_segment_{:02}", seg_idx);
+            if config.resume {
+                if let Some(existing_receipt) = load_receipt(&proof_name) {
+                    // Verify existing proof is valid
+                    if existing_receipt.verify(PHASE1A_CACHE_SEGMENT_ID).is_ok() {
+                        let output: Phase1aOutput = existing_receipt.journal.decode()
+                            .expect("Failed to decode existing proof output");
+                        segment_hashes.push(output.segment_hash);
+                        log(&format!("    SKIPPED - valid proof exists"));
+                        log(&format!("    Segment hash: 0x{}...", hex::encode(&output.segment_hash[..8])));
+                        continue;
+                    } else {
+                        log("    Existing proof invalid, reproving...");
+                    }
+                }
+            }
+
+            // Log memory usage before each segment
+            sys.refresh_memory();
+            let mem_used = sys.used_memory();
+            log(&format!("    Memory before proving: {:.2} GB used", mem_used as f64 / 1_073_741_824.0));
 
             let segment_start = seg_idx * segment_size;
             let (prev_p1, prev_p2) = &boundaries[seg_idx];
@@ -1171,27 +1173,43 @@ fn main() {
                     let output: Phase1aOutput = info.receipt.journal.decode()
                         .expect("Failed to decode Phase 1a output");
 
-                    phase1_cycles += info.stats.total_cycles;
+                    let cycles = info.stats.total_cycles;
+                    phase1_cycles += cycles;
                     segment_hashes.push(output.segment_hash);
 
                     log(&format!("    Segment {} PROVED in {}", seg_idx, format_duration(seg_time.as_secs())));
                     log(&format!("    Segment hash: 0x{}...", hex::encode(&output.segment_hash[..8])));
-                    log(&format!("    Cycles: {}", format_number(info.stats.total_cycles)));
+                    log(&format!("    Cycles: {}", format_number(cycles)));
 
                     // Verify segment proof
-                    match info.receipt.verify(PHASE1A_CACHE_SEGMENT_ID) {
-                        Ok(_) => log("    Segment proof VALID!"),
+                    let verify_result = info.receipt.verify(PHASE1A_CACHE_SEGMENT_ID);
+
+                    match verify_result {
+                        Ok(_) => {
+                            log("    Segment proof VALID!");
+                            // Save proof to disk BEFORE dropping
+                            if let Err(e) = save_receipt(&proof_name, &info.receipt) {
+                                log(&format!("    Warning: Failed to save proof: {}", e));
+                            }
+                        }
                         Err(e) => {
                             log(&format!("ERROR: Segment {} verification failed: {}", seg_idx, e));
                             return;
                         }
                     }
+
+                    // Explicitly drop the proof to free memory before next segment
+                    drop(info);
                 }
                 Err(e) => {
                     log(&format!("ERROR: Segment {} failed: {}", seg_idx, e));
                     return;
                 }
             }
+
+            // Log memory after proving
+            sys.refresh_memory();
+            log(&format!("    Memory after segment: {:.2} GB used", sys.used_memory() as f64 / 1_073_741_824.0));
         }
 
         // Verify segment hashes combine to full cache hash
@@ -1211,15 +1229,14 @@ fn main() {
         }
         log("All segment hashes VERIFIED!");
 
-        // Exit early for challenge mode
-        if run_challenge {
+        // Exit early for single cache segment mode
+        if let ProofMode::CacheSegment(seg) = &config.mode {
             let phase1_time = phase1_start.elapsed();
             log_separator();
-            println!("  CHALLENGE PROOF COMPLETE!");
+            println!("  CACHE SEGMENT PROOF COMPLETE!");
             log_separator();
-            log(&format!("Segment {} proven in {}", challenge_segment, format_duration(phase1_time.as_secs())));
+            log(&format!("Segment {} proven in {}", seg, format_duration(phase1_time.as_secs())));
             log(&format!("Cycles: {}", format_number(phase1_cycles)));
-            log("This proof can be used to challenge a fraudulent cache commitment.");
             log_separator();
             return;
         }
@@ -1227,7 +1244,7 @@ fn main() {
 
     let phase1_time = phase1_start.elapsed();
 
-    if run_cache || proof_mode == ProofMode::Full {
+    if run_cache || matches!(config.mode, ProofMode::Full) {
         log_separator();
         log("Phase 1 Summary:");
         println!("    Mode: Full Cache ({} segments)", CACHE_SEGMENTS);
@@ -1241,7 +1258,7 @@ fn main() {
     }
 
     // Exit early for cache-only mode
-    if proof_mode == ProofMode::Cache {
+    if matches!(config.mode, ProofMode::Cache) {
         log_separator();
         println!("  CACHE PROOF COMPLETE!");
         log_separator();
@@ -1254,7 +1271,19 @@ fn main() {
     // PHASE 2: Block PoW Execution (Program Segments + Merkle Proofs)
     // =========================================================
     log_separator();
-    println!("  PHASE 2: BLOCK POW VERIFICATION (PROGRAM SEGMENTS)");
+
+    // Check if we're proving a single segment or all programs
+    let block_segment = if let ProofMode::BlockSegment(seg) = config.mode {
+        Some(seg)
+    } else {
+        None
+    };
+
+    if let Some(seg_id) = block_segment {
+        println!("  PHASE 2: SINGLE SEGMENT PROVING (segment {})", seg_id);
+    } else {
+        println!("  PHASE 2: BLOCK POW VERIFICATION (PROGRAM SEGMENTS)");
+    }
     log_separator();
 
     log("Building Merkle tree from cache...");
@@ -1264,6 +1293,162 @@ fn main() {
     log(&format!("Merkle root: 0x{}...", hex::encode(&merkle_root[..8])));
     log(&format!("Tree height: {} levels ({} items)", merkle_tree.len(), RANDOMX_DATASET_ITEM_COUNT));
 
+    // If proving a single segment, we need different simulation
+    let phase2_start = Instant::now();
+    let mut phase2_cycles: u64 = 0;
+    let mut final_pow_hash = [0u8; 32];
+    let mut final_difficulty_valid = false;
+
+    if let Some(seg_id) = block_segment {
+        // =========================================================
+        // SINGLE SEGMENT PROVING MODE
+        // =========================================================
+        let (prog_idx, iteration_start, iteration_count) = segment_to_params(seg_id);
+
+        log(&format!("Segment {} = Program {}, iterations {}-{}",
+            seg_id, prog_idx, iteration_start, iteration_start + iteration_count));
+
+        // First, simulate all programs to get the correct seed/scratchpad for this program
+        log("Simulating programs to get state for target program...");
+        let sim_start = Instant::now();
+        let simulation = randomx_vm::simulate_all_programs(
+            &cache,
+            &header.hashing_blob,
+            SCRATCHPAD_SIZE,
+            ITERATIONS,
+            RANDOMX_DATASET_ITEM_COUNT,
+        );
+        log(&format!("Simulation completed in {:.2?}", sim_start.elapsed()));
+
+        // Now simulate the specific chunk to get dataset accesses and initial registers
+        log(&format!("Simulating chunk {} of program {}...", iteration_start / ITERATIONS_PER_CHUNK, prog_idx));
+        let chunk_sim = randomx_vm::simulate_program_chunk(
+            &cache,
+            &simulation.seeds[prog_idx],
+            &simulation.scratchpads[prog_idx],
+            iteration_start,
+            iteration_count,
+            RANDOMX_DATASET_ITEM_COUNT,
+        );
+
+        let unique_indices: std::collections::BTreeSet<u64> = chunk_sim.accesses.iter().copied().collect();
+        log(&format!("Chunk accesses: {} total, {} unique items", chunk_sim.accesses.len(), unique_indices.len()));
+
+        // Collect dataset items with Merkle proofs
+        let mut dataset_items: Vec<DatasetItemEntry> = Vec::with_capacity(unique_indices.len());
+        for &idx in &unique_indices {
+            let item_start = (idx as usize) * 64;
+            let mut item = [0u8; 64];
+            item.copy_from_slice(&cache[item_start..item_start + 64]);
+            let proof = generate_merkle_proof(&merkle_tree, idx as usize);
+            dataset_items.push(DatasetItemEntry {
+                index: idx,
+                item,
+                proof,
+            });
+        }
+
+        // is_first only if program 0 AND iteration_start == 0
+        let is_first = prog_idx == 0 && iteration_start == 0;
+        // is_last only if program 7 AND this chunk ends at iteration 2048
+        let is_last = prog_idx == PROGRAM_COUNT - 1 && (iteration_start + iteration_count) == ITERATIONS;
+
+        let segment_input = ProgramSegmentInput {
+            program_index: prog_idx as u8,
+            is_first,
+            is_last,
+            iteration_start: iteration_start as u16,
+            iteration_count: iteration_count as u16,
+            randomx_key,
+            dataset_merkle_root: merkle_root,
+            input_data: if is_first { header.hashing_blob.clone() } else { vec![] },
+            seed: simulation.seeds[prog_idx],
+            scratchpad: simulation.scratchpads[prog_idx].clone(),
+            initial_registers: chunk_sim.initial_registers.clone(),
+            dataset_items,
+            difficulty,
+        };
+
+        let input_size = std::mem::size_of_val(&segment_input);
+        log(&format!("Input size: ~{:.2} KiB", input_size as f64 / 1024.0));
+
+        let seg_env = ExecutorEnv::builder()
+            .write(&segment_input)
+            .expect("Failed to write segment input")
+            .build()
+            .expect("Failed to build segment executor env");
+
+        log("Proving segment...");
+        let seg_start = Instant::now();
+
+        let seg_result = prover.prove_with_ctx(
+            seg_env,
+            &VerifierContext::default(),
+            PHASE2_PROGRAM_ELF,
+            &opts,
+        );
+
+        let seg_time = seg_start.elapsed();
+
+        match seg_result {
+            Ok(info) => {
+                let output: ProgramSegmentOutput = info.receipt.journal.decode()
+                    .expect("Failed to decode segment output");
+
+                phase2_cycles = info.stats.total_cycles;
+
+                log(&format!("Segment {} PROVED in {}", seg_id, format_duration(seg_time.as_secs())));
+                log(&format!("Cycles: {}", format_number(phase2_cycles)));
+                log(&format!("Scratchpad hash: 0x{}...", hex::encode(&output.scratchpad_hash[..8])));
+                log(&format!("Register hash: 0x{}...", hex::encode(&output.register_hash[..8])));
+
+                // Verify segment proof
+                match info.receipt.verify(PHASE2_PROGRAM_ID) {
+                    Ok(_) => {
+                        log("Segment proof VALID!");
+                        let proof_name = format!("segment_{}", seg_id);
+                        if let Err(e) = save_receipt(&proof_name, &info.receipt) {
+                            log(&format!("Warning: Failed to save proof: {}", e));
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!("ERROR: Segment verification failed: {}", e));
+                        return;
+                    }
+                }
+
+                if is_last {
+                    if let Some(pow_hash) = output.pow_hash {
+                        final_pow_hash = pow_hash;
+                        log(&format!("Final PoW hash: 0x{}...", hex::encode(&pow_hash[..8])));
+                    }
+                    if let Some(valid) = output.difficulty_valid {
+                        final_difficulty_valid = valid;
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("ERROR: Segment {} failed: {}", seg_id, e));
+                return;
+            }
+        }
+
+        let phase2_time = phase2_start.elapsed();
+
+        log_separator();
+        log("Single Segment Proof Complete!");
+        log(&format!("Segment: {} (Program {}, iterations {}-{})",
+            seg_id, prog_idx, iteration_start, iteration_start + iteration_count));
+        log(&format!("Cycles: {}", format_number(phase2_cycles)));
+        log(&format!("Time: {}", format_duration(phase2_time.as_secs())));
+        log(&format!("Merkle Root: 0x{}...", hex::encode(&merkle_root[..8])));
+        log_separator();
+        return;
+    }
+
+    // =========================================================
+    // FULL BLOCK PROVING MODE (all 8 programs)
+    // =========================================================
     log("Simulating programs to find dataset accesses...");
     let sim_start = Instant::now();
     let simulation = randomx_vm::simulate_all_programs(
@@ -1288,11 +1473,19 @@ fn main() {
     log("Each segment: ~1.5 MiB input (vs 256 MiB monolithic)");
     println!();
 
-    let phase2_start = Instant::now();
-    let mut phase2_cycles: u64 = 0;
-
-    let mut final_pow_hash = [0u8; 32];
-    let mut final_difficulty_valid = false;
+    // Check for existing program proofs (only if resume mode enabled)
+    if config.resume {
+        let mut existing_prog_count = 0;
+        for prog_idx in 0..PROGRAM_COUNT {
+            if has_valid_program_proof(prog_idx) {
+                existing_prog_count += 1;
+            }
+        }
+        if existing_prog_count > 0 {
+            log(&format!("RESUME MODE: Found {} existing valid program proofs in {}/", existing_prog_count, PROOFS_DIR));
+            log("Will skip already-proven programs");
+        }
+    }
 
     for prog_idx in 0..PROGRAM_COUNT {
         log_separator();
@@ -1300,6 +1493,36 @@ fn main() {
 
         let is_first = prog_idx == 0;
         let is_last = prog_idx == PROGRAM_COUNT - 1;
+
+        // Check if this program was already proven (only if resume mode enabled)
+        let proof_name = format!("program_{}", prog_idx);
+        if config.resume {
+            if let Some(existing_receipt) = load_receipt(&proof_name) {
+                if existing_receipt.verify(PHASE2_PROGRAM_ID).is_ok() {
+                    let output: ProgramSegmentOutput = existing_receipt.journal.decode()
+                        .expect("Failed to decode existing proof output");
+                    log(&format!("    SKIPPED - valid proof exists"));
+
+                    // Verify Merkle root matches
+                    if output.dataset_merkle_root != merkle_root {
+                        log(&format!("ERROR: Program {} Merkle root mismatch! Reproving...", prog_idx));
+                    } else {
+                        if is_last {
+                            if let Some(pow_hash) = output.pow_hash {
+                                final_pow_hash = pow_hash;
+                                log(&format!("    Final PoW hash: 0x{}...", hex::encode(&pow_hash[..8])));
+                            }
+                            if let Some(valid) = output.difficulty_valid {
+                                final_difficulty_valid = valid;
+                            }
+                        }
+                        continue;
+                    }
+                } else {
+                    log("    Existing proof invalid, reproving...");
+                }
+            }
+        }
 
         // Use seed and scratchpad from simulation (CRITICAL: these match what the guest expects)
         let current_seed = simulation.seeds[prog_idx];
@@ -1332,11 +1555,14 @@ fn main() {
             program_index: prog_idx as u8,
             is_first,
             is_last,
+            iteration_start: 0,
+            iteration_count: ITERATIONS as u16,
             randomx_key,
             dataset_merkle_root: merkle_root,
             input_data: if is_first { header.hashing_blob.clone() } else { vec![] },
             seed: current_seed,
             scratchpad: current_scratchpad.to_vec(),
+            initial_registers: vec![],  // Empty for iteration_start=0
             dataset_items,
             difficulty,
         };
@@ -1364,19 +1590,31 @@ fn main() {
                 let output: ProgramSegmentOutput = info.receipt.journal.decode()
                     .expect("Failed to decode segment output");
 
-                phase2_cycles += info.stats.total_cycles;
+                let cycles = info.stats.total_cycles;
+                phase2_cycles += cycles;
 
                 log(&format!("    Program {} PROVED in {}", prog_idx, format_duration(seg_time.as_secs())));
-                log(&format!("    Cycles: {}", format_number(info.stats.total_cycles)));
+                log(&format!("    Cycles: {}", format_number(cycles)));
 
                 // Verify segment proof
-                match info.receipt.verify(PHASE2_PROGRAM_ID) {
-                    Ok(_) => log("    Segment proof VALID!"),
+                let verify_result = info.receipt.verify(PHASE2_PROGRAM_ID);
+
+                match verify_result {
+                    Ok(_) => {
+                        log("    Segment proof VALID!");
+                        // Save proof to disk BEFORE dropping
+                        if let Err(e) = save_receipt(&proof_name, &info.receipt) {
+                            log(&format!("    Warning: Failed to save proof: {}", e));
+                        }
+                    }
                     Err(e) => {
                         log(&format!("ERROR: Program {} verification failed: {}", prog_idx, e));
                         return;
                     }
                 }
+
+                // Explicitly drop the proof to free memory before next program
+                drop(info);
 
                 // Verify Merkle root matches
                 if output.dataset_merkle_root != merkle_root {
@@ -1402,6 +1640,10 @@ fn main() {
                 return;
             }
         }
+
+        // Log memory after segment
+        sys.refresh_memory();
+        log(&format!("    Memory after segment: {:.2} GB used", sys.used_memory() as f64 / 1_073_741_824.0));
     }
 
     let phase2_time = phase2_start.elapsed();
