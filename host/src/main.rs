@@ -19,6 +19,8 @@
 //!
 //! Monero Spec: 256 MiB cache, 2 MiB scratchpad, 8 programs, 2048 iterations
 
+mod randomx_vm;
+
 use methods::{
     PHASE1A_CACHE_SEGMENT_ELF, PHASE1A_CACHE_SEGMENT_ID,
     PHASE2_PROGRAM_ELF, PHASE2_PROGRAM_ID,
@@ -34,7 +36,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use blake2::{Blake2b512, Digest};
 
 /// Version - keep in sync with methods/guest/src/lib.rs
-const VERSION: &str = "v21";
+const VERSION: &str = "v22";
 
 // ============================================================
 // MONERO RANDOMX SPECIFICATION (must match guest)
@@ -769,145 +771,7 @@ fn generate_merkle_proof(tree: &[Vec<[u8; 32]>], index: usize) -> Vec<u8> {
 // ============================================================
 // HOST-SIDE VM SIMULATION (for collecting dataset accesses)
 // ============================================================
-
-/// Simple host-side program structure for dataset access collection
-struct HostProgram {
-    entropy: [u64; 128],
-}
-
-impl HostProgram {
-    fn generate(seed: &[u8; 64]) -> Self {
-        // Simplified program generation (just enough for dataset access patterns)
-        let mut entropy = [0u64; 128];
-        let mut state = [0u8; 64];
-        state.copy_from_slice(seed);
-
-        for i in 0..128 {
-            // Simple hash-based entropy (doesn't need to match exactly, just close enough)
-            let hash = blake2b_256(&state);
-            entropy[i] = u64::from_le_bytes([
-                hash[0], hash[1], hash[2], hash[3],
-                hash[4], hash[5], hash[6], hash[7],
-            ]);
-            state[..32].copy_from_slice(&hash);
-        }
-
-        Self { entropy }
-    }
-}
-
-/// Host-side VM state for simulating dataset accesses
-struct HostVmState {
-    int_regs: [u64; 8],
-    mx: u32,
-    scratchpad: Vec<u8>,
-}
-
-impl HostVmState {
-    fn new(scratchpad_size: usize) -> Self {
-        Self {
-            int_regs: [0u64; 8],
-            mx: 0,
-            scratchpad: vec![0u8; scratchpad_size],
-        }
-    }
-
-    fn init(&mut self, seed: &[u8; 64], program: &HostProgram) {
-        // Initialize registers from seed
-        for i in 0..8 {
-            self.int_regs[i] = u64::from_le_bytes([
-                seed[i * 8], seed[i * 8 + 1], seed[i * 8 + 2], seed[i * 8 + 3],
-                seed[i * 8 + 4], seed[i * 8 + 5], seed[i * 8 + 6], seed[i * 8 + 7],
-            ]);
-        }
-
-        // Initialize mx from program entropy
-        self.mx = (program.entropy[0] & 0xFFFFFFFF) as u32;
-    }
-
-    /// Execute program and return list of accessed dataset item indices
-    fn simulate_program_accesses(&mut self, cache: &[u8]) -> Vec<u64> {
-        let mut accessed = Vec::new();
-        let num_items = RANDOMX_DATASET_ITEM_COUNT as u64;
-
-        for _ in 0..ITERATIONS {
-            // Calculate dataset item index (simplified)
-            let item_idx = (self.mx as u64)
-                .wrapping_mul(self.int_regs[0])
-                % num_items;
-
-            accessed.push(item_idx);
-
-            // Get dataset item and mix into registers
-            let item_start = (item_idx as usize) * 64;
-            let dataset_item = &cache[item_start..item_start + 64];
-
-            for i in 0..8 {
-                let val = u64::from_le_bytes([
-                    dataset_item[i * 8],
-                    dataset_item[i * 8 + 1],
-                    dataset_item[i * 8 + 2],
-                    dataset_item[i * 8 + 3],
-                    dataset_item[i * 8 + 4],
-                    dataset_item[i * 8 + 5],
-                    dataset_item[i * 8 + 6],
-                    dataset_item[i * 8 + 7],
-                ]);
-                self.int_regs[i] ^= val;
-            }
-
-            // Update mx for next iteration
-            self.mx ^= self.int_regs[0] as u32;
-            self.mx = self.mx.wrapping_mul(0x9E3779B9).wrapping_add(0x85EBCA6B);
-        }
-
-        accessed
-    }
-}
-
-/// Simulate all 8 programs and return dataset accesses for each
-fn simulate_all_programs(
-    cache: &[u8],
-    input_data: &[u8],
-) -> Vec<Vec<u64>> {
-    let mut all_accesses = Vec::new();
-
-    // Initial seed from input data
-    let mut seed = [0u8; 64];
-    let hash = blake2b_256(input_data);
-    seed[..32].copy_from_slice(&hash);
-    seed[32..].copy_from_slice(&hash);
-
-    // Fill initial scratchpad
-    let mut scratchpad = vec![0u8; SCRATCHPAD_SIZE];
-    soft_aes_fill_scratchpad(&seed, &mut scratchpad);
-
-    for _prog_idx in 0..PROGRAM_COUNT {
-        let program = HostProgram::generate(&seed);
-        let mut vm = HostVmState::new(SCRATCHPAD_SIZE);
-        vm.scratchpad = scratchpad.clone();
-        vm.init(&seed, &program);
-
-        let accesses = vm.simulate_program_accesses(cache);
-        all_accesses.push(accesses);
-
-        // Generate next seed (simplified - just hash the registers)
-        let mut reg_data = [0u8; 64];
-        for i in 0..8 {
-            let bytes = vm.int_regs[i].to_le_bytes();
-            reg_data[i * 8..i * 8 + 8].copy_from_slice(&bytes);
-        }
-        seed = [0u8; 64];
-        let new_hash = blake2b_256(&reg_data);
-        seed[..32].copy_from_slice(&new_hash);
-        seed[32..].copy_from_slice(&new_hash);
-
-        // Update scratchpad for next program (simplified)
-        scratchpad = vm.scratchpad;
-    }
-
-    all_accesses
-}
+// See randomx_vm module for accurate VM simulation that matches guest execution
 
 fn main() {
     let proof_mode = ProofMode::from_env();
@@ -1212,7 +1076,13 @@ fn main() {
 
     log("Simulating programs to find dataset accesses...");
     let sim_start = Instant::now();
-    let all_accesses = simulate_all_programs(&cache, &header.hashing_blob);
+    let all_accesses = randomx_vm::simulate_all_programs(
+        &cache,
+        &header.hashing_blob,
+        SCRATCHPAD_SIZE,
+        ITERATIONS,
+        RANDOMX_DATASET_ITEM_COUNT,
+    );
     log(&format!("Simulation completed in {:.2?}", sim_start.elapsed()));
     for (i, accesses) in all_accesses.iter().enumerate() {
         let unique: std::collections::HashSet<_> = accesses.iter().collect();
