@@ -16,12 +16,10 @@ pub mod randomx;
 ///   - Dockerfile.gpu-runtime (line ~74 and tag)
 ///   - deploy-akash-runtime.yaml (image tag)
 ///   - .github/workflows/docker-build-gpu-runtime.yml (tags)
-pub const VERSION: &str = "v26";
+pub const VERSION: &str = "v28";
 
 // ----------------- FULL MONERO SPEC -----------------
 // These are ALWAYS the full Monero spec values.
-// TEST_MODE env var only affects INPUT DATA (test block vs real block),
-// NOT the cryptographic parameters.
 
 /// Cache size: 256 MiB
 pub const CACHE_SIZE: usize = 268435456;

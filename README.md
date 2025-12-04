@@ -1,6 +1,6 @@
 # Monero RandomX zkVM Verification
 
-**Version: v21** | Zero-knowledge proof system for Monero block verification
+**Version: v27** | Zero-knowledge proof system for Monero block verification
 
 ## Overview
 
@@ -17,9 +17,9 @@ This project enables trustless verification of Monero proof-of-work by generatin
 Phase 1: Cache Initialization          Phase 2: Block PoW
 (reusable ~2048 blocks)                (per block)
 ┌─────────────────────────┐            ┌─────────────────────────┐
-│  64 segments × 4 MiB    │            │  8 programs × ~1.5 MiB  │
-│  = 256 MiB total cache  │───────────▶│  with Merkle proofs     │
-│                         │   Merkle   │                         │
+│  64 segments × 4 MiB    │            │  8 programs × 32 chunks │
+│  = 256 MiB total cache  │───────────▶│  = 256 block segments   │
+│                         │   Merkle   │  with Merkle proofs     │
 │  Argon2d + AES expand   │    Root    │  RandomX VM execution   │
 └─────────────────────────┘            └─────────────────────────┘
 ```
@@ -30,19 +30,9 @@ Phase 1: Cache Initialization          Phase 2: Block PoW
 - Reusable for ~2048 blocks (~3 days)
 
 **Phase 2**: Proves RandomX VM execution with Merkle proofs
-- 8 program segments, each ~1.5 MiB input
-- ~170× smaller than monolithic 256 MiB approach
-- Pre-execution identifies accessed dataset items
+- 8 programs × 32 chunks = 256 block segments
+- Each chunk = 64 iterations with ~64 dataset accesses
 - Merkle proofs verify items against Phase 1 root
-
-### Merkle Tree Optimization
-
-Instead of passing the full 256 MiB cache:
-
-1. Build Merkle tree from ~4.2M dataset items (64 bytes each)
-2. Pre-execute programs on host to identify ~2048 accessed items per program
-3. Provide only accessed items with Merkle proofs (~1.5 MiB total)
-4. zkVM verifies proofs and executes program
 
 ## Quick Start
 
@@ -57,11 +47,17 @@ rzup install
 ### Build & Run
 
 ```bash
-# Test mode (uses dummy block data)
-PROOF_MODE=block TEST_MODE=true cargo run -r -p host
+# Full proof with test data
+cargo run -r -p host
+
+# Specific modes
+cargo run -r -p host -- cache              # Full cache (64 segments)
+cargo run -r -p host -- block              # Full block (8 programs)
+cargo run -r -p host -- cache-segment 5    # Single cache segment
+cargo run -r -p host -- block-segment 42   # Single block segment
 
 # With GPU acceleration (recommended)
-RISC0_PROVER=cuda PROOF_MODE=block cargo run -r -p host
+RISC0_PROVER=cuda cargo run -r -p host -- block
 ```
 
 ### Docker (GPU Runtime)
@@ -70,44 +66,50 @@ RISC0_PROVER=cuda PROOF_MODE=block cargo run -r -p host
 # Build image
 docker build -f Dockerfile.gpu-runtime -t randomx-zkvm-gpu .
 
-# Run with GPU
-docker run --gpus all randomx-zkvm-gpu
+# Run with GPU (drops to shell with prover CLI)
+docker run -it --gpus all randomx-zkvm-gpu
+
+# Inside container:
+prover --help
+prover block-segment 42
+prover cache
 ```
 
-## Proof Modes
+## CLI Usage
 
-Set via `PROOF_MODE` environment variable:
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `cache` | Prove all 64 cache segments | Pro tier deposit |
-| `block` | Prove 8 program segments | Per-block verification |
-| `challenge` | Prove single cache segment | Fraud proof |
-| `full` | Both cache + block (default) | Complete verification |
-
-## Configuration
-
-### Environment Variables
-
-```bash
-# Proof mode
-PROOF_MODE=block          # cache | block | challenge | full
-
-# Input data source
-TEST_MODE=true            # true = test data, false = real Monero data
-
-# Real data mode (when TEST_MODE=false)
-RANDOMX_KEY=<hex>         # 32-byte RandomX key
-HASHING_BLOB=<hex>        # Block hashing blob
-BLOCK_HEIGHT=3000000      # Block height (optional)
-DIFFICULTY=1              # Target difficulty (optional)
-
-# Challenge mode
-CHALLENGE_SEGMENT=0       # Which segment (0-63)
-
-# Prover backend
-RISC0_PROVER=local        # local | cuda | metal
 ```
+Usage: prover <mode> [options]
+
+Modes:
+  cache               Prove full cache hash (64 segments)
+  cache-segment <N>   Prove single cache segment (0-63)
+  block               Prove full block PoW (8 programs)
+  block-segment <N>   Prove single block segment (0-255)
+  full                Prove cache + block (default)
+
+Options:
+  --randomx-key <HEX>   32-byte RandomX key (uses test key if omitted)
+  --hashing-blob <HEX>  Block hashing blob (uses test blob if omitted)
+  --difficulty <N>      Target difficulty (default: 1)
+  --resume              Skip segments with existing valid proofs
+  --help, -h            Show this help
+
+Examples:
+  prover full                           # Full proof with test data
+  prover cache-segment 5                # Prove cache segment 5
+  prover block-segment 42               # Prove block segment 42
+  prover block --randomx-key abc123...  # Full block with real key
+```
+
+### Segment IDs
+
+**Cache segments (Phase 1)**: 0-63 (4 MiB each)
+
+**Block segments (Phase 2)**: 0-255
+- Segments 0-31 = Program 0, chunks 0-31
+- Segments 32-63 = Program 1, chunks 0-31
+- ...
+- Segments 224-255 = Program 7, chunks 0-31
 
 ### Monero Specification
 
@@ -116,13 +118,16 @@ RISC0_PROVER=local        # local | cuda | metal
 | Cache Size | 256 MiB (64 × 4 MiB segments) |
 | Scratchpad | 2 MiB |
 | Programs | 8 × 2048 iterations |
+| Chunks per Program | 32 × 64 iterations |
 | Dataset Items | ~4.2M (64 bytes each) |
 
 ## Project Structure
 
 ```
 ├── host/                        # Host-side prover
-│   └── src/main.rs             # Merkle tree, pre-execution, proving
+│   └── src/
+│       ├── main.rs             # CLI, Merkle tree, proving
+│       └── randomx_vm.rs       # VM simulation for pre-execution
 ├── methods/
 │   ├── guest/                  # Shared RandomX library
 │   │   └── src/
@@ -136,11 +141,9 @@ RISC0_PROVER=local        # local | cuda | metal
 │   │           ├── vm.rs       # VM execution
 │   │           └── ...
 │   ├── phase1a-cache-segment/  # Cache segment guest
-│   ├── phase2-program/         # Program segment guest (v21)
-│   └── phase2-vm/              # Legacy monolithic guest
+│   └── phase2-program/         # Program segment guest
 ├── Dockerfile.gpu-runtime
-├── deploy-akash-runtime.yaml
-└── env.example
+└── deploy-akash-runtime.yaml
 ```
 
 ## RandomX Implementation
@@ -156,7 +159,8 @@ RISC0_PROVER=local        # local | cuda | metal
 | Superscalar programs | Complete |
 | Light mode dataset | Complete |
 | Difficulty verification | Complete |
-| Merkle proofs | Complete (v21) |
+| Merkle proofs | Complete |
+| Chunked proving (256 segments) | Complete |
 
 ### All 30 RandomX Instructions
 
@@ -182,8 +186,8 @@ RISC0_PROVER=local        # local | cuda | metal
 | Phase | Segments | Est. Time |
 |-------|----------|-----------|
 | Phase 1 (cache) | 64 | 4-8 hours |
-| Phase 2 (block) | 8 | 1-2 hours |
-| Challenge | 1 | 10-20 min |
+| Phase 2 (block) | 8 programs | 1-2 hours |
+| Single segment | 1 | 10-20 min |
 
 Phase 1 cache proof reusable for ~2048 blocks (~3 days).
 
@@ -207,11 +211,11 @@ akash tx deployment create deploy-akash-runtime.yaml
 
 ```bash
 # Build and push
-docker build -f Dockerfile.gpu-runtime -t ghcr.io/USER/randomx-zkvm:gpu-runtime-v21 .
-docker push ghcr.io/USER/randomx-zkvm:gpu-runtime-v21
+docker build -f Dockerfile.gpu-runtime -t ghcr.io/USER/randomx-zkvm:gpu-runtime-v27 .
+docker push ghcr.io/USER/randomx-zkvm:gpu-runtime-v27
 
 # Run on Vast.ai, RunPod, Lambda, etc.
-docker run --gpus all ghcr.io/USER/randomx-zkvm:gpu-runtime-v21
+docker run -it --gpus all ghcr.io/USER/randomx-zkvm:gpu-runtime-v27
 ```
 
 ## References

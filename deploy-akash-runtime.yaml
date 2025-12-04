@@ -3,16 +3,14 @@ version: "2.0"
 
 services:
   randomx-zkvm:
-    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v26
+    image: ghcr.io/zenopie/zkvm-test:gpu-runtime-v28
     env:
-      - PROOF_MODE=cache
-      - TEST_MODE=true
       - RISC0_PROVER=local
       - RUST_LOG=info,risc0_zkvm=debug,risc0_circuit_rv32im=info,risc0_prover=debug
       - RUST_BACKTRACE=full
     expose:
-      - port: 8080
-        as: 80
+      - port: 22
+        as: 22
         to:
           - global: true
 
