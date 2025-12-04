@@ -1,4 +1,4 @@
-name: Build and Push GPU Runtime Image
+name: Build and Push GPU Pre-compiled Image
 
 on:
   push:
@@ -33,19 +33,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push GPU Runtime image
+      - name: Build and push GPU Pre-compiled image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.gpu-runtime
+          file: ./Dockerfile.gpu
           push: true
           tags: |
-            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime
-            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime-v29
+            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu
+            ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-v30
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Output Image URL
         run: |
-          echo "GPU Runtime Image pushed to: ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu-runtime"
-          echo "This image builds with CUDA at runtime on GPU nodes"
+          echo "GPU Pre-compiled Image pushed to: ghcr.io/${{ steps.set_repo.outputs.REPO_NAME }}:gpu"
+          echo "This image has CUDA binaries pre-compiled (no runtime build needed)"
